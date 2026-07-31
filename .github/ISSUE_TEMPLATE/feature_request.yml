@@ -1,0 +1,76 @@
+name: Feature request
+description: Suggest an improvement for Game Night Bot
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Describe the problem first so
+        contributors can consider the best solution.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and discussions for this idea.
+          required: true
+        - label: This request fits a self-hosted Discord game-night bot.
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Feature area
+      options:
+        - Wheel and spin animation
+        - Game metadata and player support
+        - Artwork and caching
+        - Wishlist and release checking
+        - Database, backups and reliability
+        - Discord commands and interface
+        - Installation and documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or opportunity
+      description: What is difficult, missing or confusing today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe how you imagine the feature working.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Are there other ways to solve the same problem?
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Would you like to work on it?
+      options:
+        - Yes, with guidance
+        - Yes, independently
+        - Maybe
+        - No
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add mockups, examples or related links here.
+
