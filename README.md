@@ -249,6 +249,20 @@ owners. They are fetched at runtime and are not included in this repository.
 The MIT licence applies to the source code, not third-party artwork,
 trademarks or API data.
 
+## Support the project
+
+Game Night Bot is free and open source. If you enjoy using it, use the
+**Sponsor** button at the top of this repository to help cover hosting, API
+and ongoing development costs.
+
+- [Sponsor on GitHub](https://github.com/sponsors/Shafty199)
+- [Support on Ko-fi](https://ko-fi.com/shafty69788)
+
+Support is completely optional. Bug reports, feature suggestions,
+documentation, testing and code contributions are equally appreciated.
+Sponsors may choose to be acknowledged in the README or release notes, but
+sponsorship does not purchase exclusive features or priority support.
+
 ## Contributing
 
 Bug reports, feature ideas, documentation improvements, testing and pull
