@@ -242,6 +242,15 @@ owners. They are fetched at runtime and are not included in this repository.
 The MIT licence applies to the source code, not third-party artwork,
 trademarks or API data.
 
+## Contributing
+
+Bug reports, feature ideas, documentation improvements, testing and pull
+requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before starting.
+
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Potential security
+vulnerabilities must be reported privately using the instructions in
+[SECURITY.md](SECURITY.md), not through a public issue.
+
 ## Licence
 
 Released under the [MIT License](LICENSE).
