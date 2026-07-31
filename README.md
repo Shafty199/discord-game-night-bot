@@ -8,6 +8,13 @@ keeps unreleased suggestions on a wishlist.
 This release is designed for **one bot instance connected to one Discord
 server**. Run a separate instance and database for each server.
 
+## See the wheel in action
+
+The wheel cycles through a fresh random selection and reveals the winner in
+one animated Discord message.
+
+![Game Night Bot wheel selecting a random game](assets/spin-demo.gif)
+
 ## Features
 
 - Steam and Epic Games Store link imports from a Discord suggestion thread
