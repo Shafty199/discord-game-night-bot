@@ -1,0 +1,36 @@
+# Secrets and private server configuration
+.env
+config.json
+
+# Python and local environments
+.cache/
+.local/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime data
+database/games.db
+database/games.db-shm
+database/games.db-wal
+database/artwork/
+database/backups/
+*.db-shm
+*.db-wal
+
+# Generated output and temporary validation data
+outputs/
+dist/
+.test-*/
+.db-smoke/
+validation-*.db*
+*.log
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
