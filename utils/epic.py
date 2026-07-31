@@ -16,6 +16,12 @@ from utils.steamgriddb import get_steamgriddb_artwork
 
 
 EPIC_STORE_HOST = "store.epicgames.com"
+EPIC_STORE_HOSTS = frozenset(
+    {
+        EPIC_STORE_HOST,
+        "www.epicgames.com",
+    }
+)
 
 VERIFIED_EPIC_GAME_METADATA = {
     # Epic's official Battle Royale listing supports 100
@@ -147,9 +153,7 @@ def clean_epic_url(
         or ""
     ).casefold()
 
-    if not hostname.endswith(
-        "epicgames.com"
-    ):
+    if hostname not in EPIC_STORE_HOSTS:
         return None
 
     return cleaned

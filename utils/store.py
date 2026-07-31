@@ -26,6 +26,15 @@ from utils.steam_api import fetch_steam_app_data
 from utils.time_utils import DISPLAY_TIMEZONE
 
 
+STEAM_STORE_HOST = "store.steampowered.com"
+EPIC_STORE_HOST = "store.epicgames.com"
+EPIC_STORE_HOSTS = frozenset(
+    {
+        EPIC_STORE_HOST,
+        "www.epicgames.com",
+    }
+)
+
 SUPPORTED_LINK_PATTERN = re.compile(
     r"https?://[^\s<>()]+",
     re.IGNORECASE,
@@ -104,6 +113,55 @@ class OpenGraphParser(HTMLParser):
 
         elif property_name == "og:image":
             self.image = cleaned_content
+
+
+class PlainTextHTMLParser(HTMLParser):
+    IGNORED_CONTENT_TAGS = {
+        "script",
+        "style",
+    }
+
+    def __init__(self):
+        super().__init__(
+            convert_charrefs=True,
+        )
+        self.parts = []
+        self.ignored_depth = 0
+
+    def handle_starttag(
+        self,
+        tag,
+        attrs,
+    ):
+        if tag.casefold() in self.IGNORED_CONTENT_TAGS:
+            self.ignored_depth += 1
+
+    def handle_endtag(
+        self,
+        tag,
+    ):
+        if (
+            tag.casefold() in self.IGNORED_CONTENT_TAGS
+            and self.ignored_depth
+        ):
+            self.ignored_depth -= 1
+
+    def handle_data(
+        self,
+        data,
+    ):
+        if (
+            not self.ignored_depth
+            and data
+        ):
+            self.parts.append(
+                data
+            )
+
+    def get_text(self) -> str:
+        return " ".join(
+            self.parts
+        )
 
 
 def clean_url(
@@ -222,16 +280,12 @@ def detect_store(
     path = parsed.path.lower()
 
     if (
-        hostname.endswith(
-            "steampowered.com"
-        )
+        hostname == STEAM_STORE_HOST
         and "/app/" in path
     ):
         return "Steam"
 
-    if hostname.endswith(
-        "epicgames.com"
-    ):
+    if hostname in EPIC_STORE_HOSTS:
         return "Epic Games Store"
 
     return None
@@ -595,40 +649,16 @@ def _html_to_plain_text(
     if not page_html:
         return ""
 
-    without_scripts = re.sub(
-        r"<script\b[^>]*>.*?</script>",
-        " ",
-        page_html,
-        flags=(
-            re.IGNORECASE
-            | re.DOTALL
-        ),
+    parser = PlainTextHTMLParser()
+    parser.feed(
+        page_html
     )
-
-    without_styles = re.sub(
-        r"<style\b[^>]*>.*?</style>",
-        " ",
-        without_scripts,
-        flags=(
-            re.IGNORECASE
-            | re.DOTALL
-        ),
-    )
-
-    plain_text = re.sub(
-        r"<[^>]+>",
-        " ",
-        without_styles,
-    )
-
-    plain_text = html.unescape(
-        plain_text
-    )
+    parser.close()
 
     return re.sub(
         r"\s+",
         " ",
-        plain_text,
+        parser.get_text(),
     ).strip()
 
 
