@@ -30,17 +30,13 @@ def _build_display_timezone(value: str):
             "DISPLAY_TIMEZONE_OFFSET must be less than 24 hours."
         )
 
-    offset = timedelta(
-        hours=hours,
-        minutes=minutes,
-    ) * sign
+    offset = timedelta(hours=hours, minutes=minutes) * sign
 
     if offset == timedelta(0):
         return timezone.utc, "UTC"
 
     minute_suffix = f":{minutes:02d}" if minutes else ""
     label = f"GMT{match.group(1)}{hours}{minute_suffix}"
-
     return timezone(offset, name=label), label
 
 
@@ -85,6 +81,7 @@ def parse_stored_datetime(
 
     try:
         parsed = datetime.fromisoformat(cleaned)
+
     except ValueError:
         return None
 
