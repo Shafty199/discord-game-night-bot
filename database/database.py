@@ -584,7 +584,7 @@ async def _add_column_if_missing(
 async def _normalise_timestamp_columns(
     db,
 ) -> int:
-    """Migrate legacy naive local timestamps to explicit UTC."""
+    """Migrate legacy naive GMT+10 timestamps to explicit UTC."""
 
     timestamp_columns = (
         ("games", "last_played"),
@@ -592,6 +592,9 @@ async def _normalise_timestamp_columns(
         ("games", "last_link_check"),
         ("game_history", "played_date"),
         ("store_replacements", "replaced_at"),
+        ("gaming_sessions", "created_at"),
+        ("gaming_sessions", "ended_at"),
+        ("gaming_session_members", "joined_at"),
     )
     updated = 0
 
@@ -707,6 +710,192 @@ async def setup_database() -> None:
             )
             """
         )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS removed_games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                store TEXT,
+                store_link TEXT,
+                external_id TEXT,
+                removed_at TEXT NOT NULL,
+                UNIQUE(store, external_id),
+                UNIQUE(store_link)
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gaming_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                host_id INTEGER NOT NULL,
+                host_name TEXT NOT NULL,
+                voice_channel_id INTEGER NOT NULL,
+                control_channel_id INTEGER,
+                control_message_id INTEGER,
+                voice_notice_message_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'starting',
+                player_count INTEGER NOT NULL,
+                manual_player_count INTEGER,
+                include_unverified INTEGER NOT NULL DEFAULT 0,
+                use_normal_wheel INTEGER NOT NULL DEFAULT 0,
+                cache_generation INTEGER NOT NULL DEFAULT 1,
+                selected_game_id INTEGER,
+                custom_game_name TEXT,
+                custom_game_link TEXT,
+                custom_game_store TEXT,
+                custom_game_image_url TEXT,
+                selected_by_id INTEGER,
+                selected_by_name TEXT,
+                created_at TEXT NOT NULL,
+                ended_at TEXT,
+                FOREIGN KEY(selected_game_id)
+                    REFERENCES games(id)
+                    ON DELETE SET NULL
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gaming_session_members (
+                session_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                joined_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'button',
+                PRIMARY KEY(session_id, user_id),
+                FOREIGN KEY(session_id)
+                    REFERENCES gaming_sessions(id)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS gaming_session_games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id INTEGER NOT NULL,
+                game_id INTEGER,
+                game_name TEXT NOT NULL,
+                game_link TEXT,
+                selected_by_id INTEGER,
+                selected_by_name TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                lock_message_channel_id INTEGER,
+                lock_message_id INTEGER,
+                FOREIGN KEY(session_id)
+                    REFERENCES gaming_sessions(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(game_id)
+                    REFERENCES games(id)
+                    ON DELETE SET NULL
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_night_weeks (
+                week_start TEXT PRIMARY KEY,
+                poll_channel_id INTEGER,
+                poll_message_id INTEGER,
+                poll_created_at TEXT,
+                poll_closes_at TEXT,
+                winner_day TEXT,
+                winner_reason TEXT,
+                friday_votes INTEGER,
+                saturday_votes INTEGER,
+                scheduled_event_id INTEGER,
+                event_start_at TEXT,
+                reminder_24h_sent INTEGER NOT NULL DEFAULT 0,
+                reminder_6h_sent INTEGER NOT NULL DEFAULT 0,
+                reminder_1h_sent INTEGER NOT NULL DEFAULT 0,
+                checkin_channel_id INTEGER,
+                checkin_message_id INTEGER,
+                checkin_closed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_night_checkins (
+                week_start TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                response TEXT NOT NULL CHECK (
+                    response IN ('playing', 'maybe', 'cant_make_it')
+                ),
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(week_start, user_id),
+                FOREIGN KEY(week_start)
+                    REFERENCES game_night_weeks(week_start)
+                    ON DELETE CASCADE
+            )
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                active_gaming_session_per_voice
+            ON gaming_sessions(guild_id, voice_channel_id)
+            WHERE status IN ('starting', 'active')
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                gaming_session_members_by_session
+            ON gaming_session_members(session_id)
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                gaming_session_games_by_session
+            ON gaming_session_games(session_id, started_at)
+            """
+        )
+
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS
+                game_night_weeks_by_event_start
+            ON game_night_weeks(event_start_at)
+            """
+        )
+
+        week_columns = []
+
+        async with db.execute(
+            "PRAGMA table_info(game_night_weeks)"
+        ) as cursor:
+            async for row in cursor:
+                week_columns.append(row[1])
+
+        for column_name, column_sql in (
+            ("checkin_channel_id", "INTEGER"),
+            ("checkin_message_id", "INTEGER"),
+            ("checkin_closed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            await _add_column_if_missing(
+                db,
+                "game_night_weeks",
+                week_columns,
+                column_name,
+                column_sql,
+            )
 
         game_columns = []
 
@@ -1050,6 +1239,77 @@ async def _find_existing_game(
         return await cursor.fetchone()
 
     return None
+
+
+async def _is_removed_game(
+    db,
+    *,
+    name: str | None,
+    store: str | None,
+    store_link: str | None,
+    source_link: str | None,
+    external_id: str | None,
+) -> bool:
+    candidate_links = {
+        link
+        for link in (
+            store_link,
+            source_link,
+        )
+        if link
+    }
+
+    if external_id and store:
+        cursor = await db.execute(
+            """
+            SELECT 1
+            FROM removed_games
+            WHERE
+                store = ? COLLATE NOCASE
+                AND external_id = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (
+                store,
+                external_id,
+            ),
+        )
+
+        if await cursor.fetchone():
+            return True
+
+    for candidate_link in candidate_links:
+        cursor = await db.execute(
+            """
+            SELECT 1
+            FROM removed_games
+            WHERE store_link = ?
+            LIMIT 1
+            """,
+            (candidate_link,),
+        )
+
+        if await cursor.fetchone():
+            return True
+
+    if name and store:
+        cursor = await db.execute(
+            """
+            SELECT 1
+            FROM removed_games
+            WHERE
+                name = ? COLLATE NOCASE
+                AND store = ? COLLATE NOCASE
+            LIMIT 1
+            """,
+            (
+                name,
+                store,
+            ),
+        )
+        return bool(await cursor.fetchone())
+
+    return False
 
 
 async def get_store_replacement(
@@ -1661,6 +1921,73 @@ async def finalise_obsolete_steam_demo(
         }
 
 
+def _build_game_cache_record(
+    *,
+    game_id,
+    name,
+    store_link,
+    store,
+    image_url,
+    external_id,
+    link_status,
+    http_status,
+    availability_status,
+    release_date,
+    coming_soon,
+    max_players,
+    max_players_source,
+    igdb_id,
+    multiplayer_support,
+    genres,
+    themes,
+    game_modes,
+) -> dict:
+    return {
+        "id": game_id,
+        "name": name,
+        "store_link": store_link,
+        "store": store,
+        "image_url": image_url,
+        "external_id": external_id,
+        "link_status": link_status,
+        "http_status": http_status,
+        "availability_status": availability_status,
+        "release_date": release_date,
+        "coming_soon": bool(coming_soon),
+        "max_players": max_players,
+        "max_players_source": max_players_source,
+        "igdb_id": igdb_id,
+        "multiplayer_support": multiplayer_support,
+        "genres": genres,
+        "themes": themes,
+        "game_modes": game_modes,
+    }
+
+
+def _sync_game_result(
+    status: str,
+    *,
+    return_details: bool,
+    record: dict | None = None,
+    artwork_changed: bool = False,
+):
+    if not return_details:
+        return status
+
+    return {
+        "status": status,
+        "game_id": (
+            record.get("id")
+            if record is not None
+            else None
+        ),
+        "record": record,
+        "artwork_changed": bool(
+            artwork_changed
+        ),
+    }
+
+
 async def sync_game(
     *,
     name: str,
@@ -1682,7 +2009,8 @@ async def sync_game(
     genres=None,
     themes=None,
     game_modes=None,
-) -> str:
+    return_details: bool = False,
+) -> str | dict:
     clean_name = (
         _clean_optional_text(name)
         or "Unknown Game"
@@ -1783,6 +2111,19 @@ async def sync_game(
     checked_at = utc_now_iso()
 
     async with database_connection() as db:
+        if await _is_removed_game(
+            db,
+            name=clean_name,
+            store=clean_store,
+            store_link=clean_store_link,
+            source_link=clean_source_link,
+            external_id=clean_external_id,
+        ):
+            return _sync_game_result(
+                "removed",
+                return_details=return_details,
+            )
+
         existing = await _find_existing_game(
             db,
             name=clean_name,
@@ -1813,6 +2154,12 @@ async def sync_game(
                 old_themes,
                 old_game_modes,
             ) = existing
+
+            existing_record = (
+                _game_cache_record_from_row(
+                    existing
+                )
+            )
 
             old_availability = (
                 old_availability
@@ -1972,16 +2319,29 @@ async def sync_game(
                 await _commit_database_write(db)
 
                 if clean_link_status == "dead":
-                    return "unavailable"
+                    return _sync_game_result(
+                        "unavailable",
+                        return_details=return_details,
+                        record=existing_record,
+                    )
 
                 if (
                     clean_availability
                     == WISHLIST_STATUS
                 ):
-                    return "wishlist_unchanged"
+                    return _sync_game_result(
+                        "wishlist_unchanged",
+                        return_details=return_details,
+                        record=existing_record,
+                    )
 
-                return "unchanged"
+                return _sync_game_result(
+                    "unchanged",
+                    return_details=return_details,
+                    record=existing_record,
+                )
 
+            saved_name = new_name
             try:
                 await db.execute(
                     """
@@ -2076,11 +2436,45 @@ async def sync_game(
                     ),
                 )
                 changed = True
+                saved_name = old_name
 
             await _commit_database_write(db)
 
+            updated_record = _build_game_cache_record(
+                game_id=game_id,
+                name=saved_name,
+                store_link=new_store_link,
+                store=new_store,
+                image_url=new_image_url,
+                external_id=new_external_id,
+                link_status=clean_link_status,
+                http_status=http_status,
+                availability_status=clean_availability,
+                release_date=new_release_date,
+                coming_soon=clean_coming_soon,
+                max_players=new_max_players,
+                max_players_source=(
+                    new_max_players_source
+                ),
+                igdb_id=new_igdb_id,
+                multiplayer_support=(
+                    new_multiplayer_support
+                ),
+                genres=new_genres,
+                themes=new_themes,
+                game_modes=new_game_modes,
+            )
+            artwork_changed = (
+                new_image_url != old_image_url
+            )
+
             if clean_link_status == "dead":
-                return "unavailable"
+                return _sync_game_result(
+                    "unavailable",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
             if (
                 old_availability
@@ -2088,7 +2482,12 @@ async def sync_game(
                 and clean_availability
                 == ACTIVE_STATUS
             ):
-                return "promoted"
+                return _sync_game_result(
+                    "promoted",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
             if (
                 old_availability
@@ -2096,7 +2495,12 @@ async def sync_game(
                 and clean_availability
                 == WISHLIST_STATUS
             ):
-                return "moved_to_wishlist"
+                return _sync_game_result(
+                    "moved_to_wishlist",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
             old_singleplayer_wheel = (
                 _belongs_on_singleplayer_wheel(
@@ -2116,37 +2520,70 @@ async def sync_game(
                 and not old_singleplayer_wheel
                 and new_singleplayer_wheel
             ):
-                return "moved_to_singleplayer"
+                return _sync_game_result(
+                    "moved_to_singleplayer",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
             if (
                 clean_availability == ACTIVE_STATUS
                 and old_singleplayer_wheel
                 and not new_singleplayer_wheel
             ):
-                return "moved_to_multiplayer"
+                return _sync_game_result(
+                    "moved_to_multiplayer",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
             if changed:
                 if (
                     clean_availability
                     == WISHLIST_STATUS
                 ):
-                    return "wishlist_updated"
+                    return _sync_game_result(
+                        "wishlist_updated",
+                        return_details=return_details,
+                        record=updated_record,
+                        artwork_changed=artwork_changed,
+                    )
 
-                return "updated"
+                return _sync_game_result(
+                    "updated",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
             if (
                 clean_availability
                 == WISHLIST_STATUS
             ):
-                return "wishlist_unchanged"
+                return _sync_game_result(
+                    "wishlist_unchanged",
+                    return_details=return_details,
+                    record=updated_record,
+                    artwork_changed=artwork_changed,
+                )
 
-            return "unchanged"
+            return _sync_game_result(
+                "unchanged",
+                return_details=return_details,
+                record=updated_record,
+                artwork_changed=artwork_changed,
+            )
 
         if clean_link_status == "dead":
-            return "unavailable"
+            return _sync_game_result(
+                "unavailable",
+                return_details=return_details,
+            )
 
         try:
-            await db.execute(
+            cursor = await db.execute(
                 """
                 INSERT INTO games (
                     name,
@@ -2202,22 +2639,80 @@ async def sync_game(
 
             await _commit_database_write(db)
 
+            inserted_record = _build_game_cache_record(
+                game_id=cursor.lastrowid,
+                name=clean_name,
+                store_link=clean_store_link,
+                store=clean_store,
+                image_url=clean_image_url,
+                external_id=clean_external_id,
+                link_status=clean_link_status,
+                http_status=http_status,
+                availability_status=clean_availability,
+                release_date=clean_release_date,
+                coming_soon=clean_coming_soon,
+                max_players=clean_max_players,
+                max_players_source=(
+                    clean_max_players_source
+                ),
+                igdb_id=clean_igdb_id,
+                multiplayer_support=(
+                    clean_multiplayer_support
+                ),
+                genres=clean_genres,
+                themes=clean_themes,
+                game_modes=clean_game_modes,
+            )
+
             if (
                 clean_availability
                 == WISHLIST_STATUS
             ):
-                return "wishlisted"
+                return _sync_game_result(
+                    "wishlisted",
+                    return_details=return_details,
+                    record=inserted_record,
+                    artwork_changed=True,
+                )
 
             if _belongs_on_singleplayer_wheel(
                 clean_max_players,
                 clean_multiplayer_support,
             ):
-                return "singleplayer_added"
+                return _sync_game_result(
+                    "singleplayer_added",
+                    return_details=return_details,
+                    record=inserted_record,
+                    artwork_changed=True,
+                )
 
-            return "added"
+            return _sync_game_result(
+                "added",
+                return_details=return_details,
+                record=inserted_record,
+                artwork_changed=True,
+            )
 
         except aiosqlite.IntegrityError:
-            return "unchanged"
+            concurrent_record = await _find_existing_game(
+                db,
+                name=clean_name,
+                store=clean_store,
+                store_link=clean_store_link,
+                source_link=clean_source_link,
+                external_id=clean_external_id,
+            )
+            return _sync_game_result(
+                "unchanged",
+                return_details=return_details,
+                record=(
+                    _game_cache_record_from_row(
+                        concurrent_record
+                    )
+                    if concurrent_record
+                    else None
+                ),
+            )
 
 
 async def add_game(
@@ -2241,6 +2736,7 @@ async def add_game(
     themes=None,
     game_modes=None,
     return_status: bool = False,
+    return_details: bool = False,
 ):
     result = await sync_game(
         name=name,
@@ -2274,7 +2770,11 @@ async def add_game(
         genres=genres,
         themes=themes,
         game_modes=game_modes,
+        return_details=return_details,
     )
+
+    if return_details:
+        return result
 
     if return_status:
         return result
@@ -2310,26 +2810,26 @@ async def get_game_cache_record(
 
 
 def _game_cache_record_from_row(row) -> dict:
-    return {
-        "id": row[0],
-        "name": row[1],
-        "store_link": row[2],
-        "store": row[3],
-        "image_url": row[4],
-        "external_id": row[5],
-        "link_status": row[6],
-        "http_status": row[7],
-        "availability_status": row[8],
-        "release_date": row[9],
-        "coming_soon": bool(row[10]),
-        "max_players": row[11],
-        "max_players_source": row[12],
-        "igdb_id": row[13],
-        "multiplayer_support": row[14],
-        "genres": row[15],
-        "themes": row[16],
-        "game_modes": row[17],
-    }
+    return _build_game_cache_record(
+        game_id=row[0],
+        name=row[1],
+        store_link=row[2],
+        store=row[3],
+        image_url=row[4],
+        external_id=row[5],
+        link_status=row[6],
+        http_status=row[7],
+        availability_status=row[8],
+        release_date=row[9],
+        coming_soon=row[10],
+        max_players=row[11],
+        max_players_source=row[12],
+        igdb_id=row[13],
+        multiplayer_support=row[14],
+        genres=row[15],
+        themes=row[16],
+        game_modes=row[17],
+    )
 
 
 async def get_all_game_cache_records() -> list[dict]:
@@ -2447,6 +2947,61 @@ async def get_all_games():
         return await cursor.fetchall()
 
 
+async def get_wheel_game_ids() -> dict[str, frozenset[int]]:
+    """Return the current eligible game IDs for each wheel."""
+
+    active_filter = """
+        COALESCE(
+            availability_status,
+            'released'
+        ) = 'released'
+        AND (
+            link_status IS NULL
+            OR link_status != 'dead'
+        )
+    """
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            f"""
+            SELECT
+                id,
+                CASE
+                    WHEN {MULTIPLAYER_WHEEL_FILTER}
+                    THEN 1
+                    ELSE 0
+                END AS multiplayer_eligible,
+                CASE
+                    WHEN {SINGLEPLAYER_WHEEL_FILTER}
+                    THEN 1
+                    ELSE 0
+                END AS singleplayer_eligible
+            FROM games
+            WHERE
+                {active_filter}
+                AND (
+                    ({MULTIPLAYER_WHEEL_FILTER})
+                    OR ({SINGLEPLAYER_WHEEL_FILTER})
+                )
+            ORDER BY id
+            """
+        )
+        rows = await cursor.fetchall()
+
+    return {
+        "multiplayer": frozenset(
+            int(row["id"])
+            for row in rows
+            if row["multiplayer_eligible"]
+        ),
+        "singleplayer": frozenset(
+            int(row["id"])
+            for row in rows
+            if row["singleplayer_eligible"]
+        ),
+    }
+
+
 async def get_all_artwork_records() -> list[dict]:
     """Return every stored game that can own a local artwork file."""
 
@@ -2534,6 +3089,252 @@ async def get_game_metadata_audit_records() -> list[dict]:
         dict(row)
         for row in rows
     ]
+
+
+async def get_games_missing_igdb_metadata() -> list[dict]:
+    """Return active games worth retrying against IGDB."""
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT
+                id,
+                name,
+                store_link,
+                store,
+                external_id,
+                max_players,
+                max_players_source,
+                igdb_id,
+                multiplayer_support_json,
+                genres_json,
+                themes_json,
+                game_modes_json
+            FROM games
+            WHERE
+                LOWER(
+                    COALESCE(
+                        availability_status,
+                        'released'
+                    )
+                ) = 'released'
+                AND LOWER(
+                    COALESCE(
+                        link_status,
+                        'unknown'
+                    )
+                ) != 'dead'
+                AND igdb_id IS NULL
+                AND (
+                    max_players IS NULL
+                    OR LOWER(
+                        COALESCE(
+                            NULLIF(
+                                TRIM(multiplayer_support_json),
+                                ''
+                            ),
+                            '{}'
+                        )
+                    ) IN ('{}', 'null')
+                    OR LOWER(
+                        COALESCE(
+                            NULLIF(TRIM(genres_json), ''),
+                            '[]'
+                        )
+                    ) IN ('[]', 'null')
+                    OR LOWER(
+                        COALESCE(
+                            NULLIF(TRIM(game_modes_json), ''),
+                            '[]'
+                        )
+                    ) IN ('[]', 'null')
+                )
+            ORDER BY id
+            """
+        )
+        rows = await cursor.fetchall()
+
+    games = []
+
+    for row in rows:
+        game = dict(row)
+
+        for column_name, field_name, expected_type in (
+            (
+                "multiplayer_support_json",
+                "multiplayer_support",
+                dict,
+            ),
+            ("genres_json", "genres", list),
+            ("themes_json", "themes", list),
+            ("game_modes_json", "game_modes", list),
+        ):
+            decoded_value = None
+            stored_value = game.pop(column_name, None)
+
+            if isinstance(stored_value, str):
+                try:
+                    candidate_value = json.loads(stored_value)
+
+                except (TypeError, ValueError):
+                    candidate_value = None
+
+                if isinstance(candidate_value, expected_type):
+                    decoded_value = candidate_value
+
+            game[field_name] = decoded_value
+
+        games.append(game)
+
+    return games
+
+
+async def save_refreshed_igdb_metadata(
+    game_id: int,
+    game_info: dict,
+) -> bool:
+    """Save a daily IGDB retry without touching store metadata."""
+
+    clean_igdb_id = _clean_igdb_id(
+        game_info.get("igdb_id")
+    )
+    clean_support = _clean_json_metadata(
+        game_info.get("multiplayer_support"),
+        dict,
+    )
+    clean_genres = _clean_json_metadata(
+        game_info.get("genres"),
+        list,
+    )
+    clean_themes = _clean_json_metadata(
+        game_info.get("themes"),
+        list,
+    )
+    clean_game_modes = _clean_json_metadata(
+        game_info.get("game_modes"),
+        list,
+    )
+
+    try:
+        clean_max_players = int(
+            game_info.get("max_players")
+        )
+
+    except (TypeError, ValueError):
+        clean_max_players = None
+
+    if (
+        clean_max_players is not None
+        and not 1 <= clean_max_players <= 100
+    ):
+        clean_max_players = None
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT
+                max_players,
+                max_players_source,
+                igdb_id,
+                multiplayer_support_json,
+                genres_json,
+                themes_json,
+                game_modes_json
+            FROM games
+            WHERE id = ?
+            """,
+            (game_id,),
+        )
+        existing = await cursor.fetchone()
+
+        if existing is None:
+            return False
+
+        old_max_players = existing["max_players"]
+        old_max_players_source = existing[
+            "max_players_source"
+        ]
+        new_max_players = old_max_players
+        new_max_players_source = old_max_players_source
+
+        if (
+            old_max_players is None
+            and clean_max_players is not None
+        ):
+            new_max_players = clean_max_players
+            new_max_players_source = "IGDB"
+
+        new_igdb_id = clean_igdb_id or existing["igdb_id"]
+        new_support = (
+            clean_support
+            if clean_support is not None
+            else existing["multiplayer_support_json"]
+        )
+        new_support = _complete_multiplayer_support_limits(
+            new_support,
+            new_max_players,
+        )
+        new_genres = (
+            clean_genres
+            if clean_genres is not None
+            else existing["genres_json"]
+        )
+        new_themes = (
+            clean_themes
+            if clean_themes is not None
+            else existing["themes_json"]
+        )
+        new_game_modes = (
+            clean_game_modes
+            if clean_game_modes is not None
+            else existing["game_modes_json"]
+        )
+
+        changed = any(
+            (
+                new_max_players != old_max_players,
+                new_max_players_source
+                != old_max_players_source,
+                new_igdb_id != existing["igdb_id"],
+                new_support
+                != existing["multiplayer_support_json"],
+                new_genres != existing["genres_json"],
+                new_themes != existing["themes_json"],
+                new_game_modes
+                != existing["game_modes_json"],
+            )
+        )
+
+        if not changed:
+            return False
+
+        await db.execute(
+            """
+            UPDATE games
+            SET
+                max_players = ?,
+                max_players_source = ?,
+                igdb_id = ?,
+                multiplayer_support_json = ?,
+                genres_json = ?,
+                themes_json = ?,
+                game_modes_json = ?
+            WHERE id = ?
+            """,
+            (
+                new_max_players,
+                new_max_players_source,
+                new_igdb_id,
+                new_support,
+                new_genres,
+                new_themes,
+                new_game_modes,
+                game_id,
+            ),
+        )
+        await _commit_database_write(db)
+
+    return True
 
 
 async def get_all_singleplayer_games():
@@ -2948,6 +3749,984 @@ async def undo_latest_history_entry(
         }
 
 
+async def get_spin_games_by_ids(
+    game_ids,
+) -> dict[int, tuple]:
+    """Return complete spin rows for a saved set of game IDs."""
+
+    clean_ids = tuple(
+        sorted(
+            {
+                int(game_id)
+                for game_id in game_ids
+            }
+        )
+    )
+
+    if not clean_ids:
+        return {}
+
+    placeholders = ", ".join(
+        "?"
+        for _game_id in clean_ids
+    )
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            f"""
+            SELECT
+                id,
+                name,
+                store_link,
+                store,
+                suggested_by,
+                times_played,
+                last_played,
+                NULLIF(image_url, '') AS display_image_url,
+                max_players,
+                image_url AS source_image_url,
+                igdb_id,
+                multiplayer_support_json,
+                genres_json,
+                themes_json,
+                game_modes_json
+            FROM games
+            WHERE
+                id IN ({placeholders})
+                AND COALESCE(
+                    availability_status,
+                    'released'
+                ) = 'released'
+                AND (
+                    link_status IS NULL
+                    OR link_status != 'dead'
+                )
+            """,
+            clean_ids,
+        )
+        rows = await cursor.fetchall()
+
+    return {
+        int(row[0]): tuple(row)
+        for row in rows
+    }
+
+
+async def get_session_wheel_game_ids(
+    player_count: int,
+    *,
+    include_unverified: bool = False,
+    use_normal_wheel: bool = False,
+) -> dict:
+    """Return the multiplayer games eligible for a session size."""
+
+    clean_player_count = max(
+        int(player_count),
+        1,
+    )
+    active_filter = f"""
+        COALESCE(
+            availability_status,
+            'released'
+        ) = 'released'
+        AND (
+            link_status IS NULL
+            OR link_status != 'dead'
+        )
+        AND {MULTIPLAYER_WHEEL_FILTER}
+    """
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            f"""
+            SELECT id, max_players
+            FROM games
+            WHERE {active_filter}
+            ORDER BY id
+            """
+        )
+        rows = await cursor.fetchall()
+
+    eligible_ids = set()
+    unverified_count = 0
+    excluded_for_capacity = 0
+
+    for row in rows:
+        game_id = int(row["id"])
+        max_players = row["max_players"]
+
+        if use_normal_wheel:
+            eligible_ids.add(game_id)
+        elif max_players is None:
+            unverified_count += 1
+
+            if include_unverified:
+                eligible_ids.add(game_id)
+        elif int(max_players) >= clean_player_count:
+            eligible_ids.add(game_id)
+        else:
+            excluded_for_capacity += 1
+
+    return {
+        "game_ids": frozenset(eligible_ids),
+        "player_count": clean_player_count,
+        "total_games": len(rows),
+        "eligible_count": len(eligible_ids),
+        "unverified_count": unverified_count,
+        "excluded_for_capacity": excluded_for_capacity,
+        "include_unverified": bool(include_unverified),
+        "use_normal_wheel": bool(use_normal_wheel),
+    }
+
+
+async def get_smart_random_game_for_ids(
+    game_ids,
+):
+    """Choose a recent-aware multiplayer game from an explicit set."""
+
+    clean_ids = tuple(
+        sorted(
+            {
+                int(game_id)
+                for game_id in game_ids
+            }
+        )
+    )
+
+    if not clean_ids:
+        return None
+
+    placeholders = ", ".join(
+        "?"
+        for _game_id in clean_ids
+    )
+    cutoff = (
+        utc_now()
+        - timedelta(days=30)
+    ).isoformat()
+    active_filter = f"""
+        id IN ({placeholders})
+        AND COALESCE(
+            availability_status,
+            'released'
+        ) = 'released'
+        AND (
+            link_status IS NULL
+            OR link_status != 'dead'
+        )
+        AND {MULTIPLAYER_WHEEL_FILTER}
+    """
+
+    async with database_connection() as db:
+        game = await _select_random_game(
+            db,
+            where_clause=(
+                f"{active_filter} AND ("
+                "last_played IS NULL OR last_played < ?)"
+            ),
+            parameters=(*clean_ids, cutoff),
+        )
+
+        if game is None:
+            game = await _select_random_game(
+                db,
+                where_clause=active_filter,
+                parameters=clean_ids,
+            )
+
+        return game
+
+
+async def search_session_games(
+    query: str,
+    *,
+    limit: int = 25,
+) -> list[dict]:
+    """Search active multiplayer-wheel games for manual selection."""
+
+    cleaned_query = str(query or "").strip()
+    like_query = f"%{cleaned_query}%"
+    clean_limit = min(
+        max(int(limit), 1),
+        25,
+    )
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            f"""
+            SELECT
+                id,
+                name,
+                store_link,
+                store,
+                NULLIF(image_url, '') AS image_url,
+                max_players,
+                max_players_source
+            FROM games
+            WHERE
+                COALESCE(
+                    availability_status,
+                    'released'
+                ) = 'released'
+                AND (
+                    link_status IS NULL
+                    OR link_status != 'dead'
+                )
+                AND {MULTIPLAYER_WHEEL_FILTER}
+                AND (? = '' OR name LIKE ? COLLATE NOCASE)
+            ORDER BY
+                CASE
+                    WHEN name = ? COLLATE NOCASE THEN 0
+                    WHEN name LIKE ? COLLATE NOCASE THEN 1
+                    ELSE 2
+                END,
+                name COLLATE NOCASE
+            LIMIT ?
+            """,
+            (
+                cleaned_query,
+                like_query,
+                cleaned_query,
+                f"{cleaned_query}%",
+                clean_limit,
+            ),
+        )
+        rows = await cursor.fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+async def create_gaming_session(
+    *,
+    guild_id: int,
+    host_id: int,
+    host_name: str,
+    voice_channel_id: int,
+    members: list[tuple[int, str]],
+) -> dict:
+    """Create one starting session and seed its voice members."""
+
+    now = utc_now_iso()
+    unique_members = {
+        int(user_id): str(display_name)
+        for user_id, display_name in members
+    }
+    player_count = max(
+        len(unique_members),
+        1,
+    )
+
+    async with database_connection() as db:
+        try:
+            cursor = await db.execute(
+                """
+                INSERT INTO gaming_sessions (
+                    guild_id,
+                    host_id,
+                    host_name,
+                    voice_channel_id,
+                    status,
+                    player_count,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, 'starting', ?, ?)
+                """,
+                (
+                    int(guild_id),
+                    int(host_id),
+                    str(host_name),
+                    int(voice_channel_id),
+                    player_count,
+                    now,
+                ),
+            )
+            session_id = int(cursor.lastrowid)
+
+            await db.executemany(
+                """
+                INSERT INTO gaming_session_members (
+                    session_id,
+                    user_id,
+                    display_name,
+                    joined_at,
+                    source
+                )
+                VALUES (?, ?, ?, ?, 'voice')
+                """,
+                (
+                    (
+                        session_id,
+                        user_id,
+                        display_name,
+                        now,
+                    )
+                    for user_id, display_name
+                    in unique_members.items()
+                ),
+            )
+            await db.commit()
+
+        except Exception:
+            await db.rollback()
+            raise
+
+    return await get_gaming_session(session_id)
+
+
+async def activate_gaming_session(
+    session_id: int,
+    *,
+    control_channel_id: int,
+    control_message_id: int,
+    voice_notice_message_id: int | None = None,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            UPDATE gaming_sessions
+            SET
+                control_channel_id = ?,
+                control_message_id = ?,
+                voice_notice_message_id = ?,
+                status = 'active'
+            WHERE id = ? AND status = 'starting'
+            """,
+            (
+                int(control_channel_id),
+                int(control_message_id),
+                (
+                    int(voice_notice_message_id)
+                    if voice_notice_message_id is not None
+                    else None
+                ),
+                int(session_id),
+            ),
+        )
+        await db.commit()
+
+    return await get_gaming_session(session_id)
+
+
+async def get_gaming_session(
+    session_id: int,
+) -> dict | None:
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM gaming_sessions
+            WHERE id = ?
+            """,
+            (int(session_id),),
+        )
+        row = await cursor.fetchone()
+
+        if row is None:
+            return None
+
+        member_cursor = await db.execute(
+            """
+            SELECT user_id, display_name, joined_at, source
+            FROM gaming_session_members
+            WHERE session_id = ?
+            ORDER BY joined_at, user_id
+            """,
+            (int(session_id),),
+        )
+        members = await member_cursor.fetchall()
+
+        games_cursor = await db.execute(
+            """
+            SELECT
+                id,
+                game_id,
+                game_name,
+                game_link,
+                selected_by_id,
+                selected_by_name,
+                started_at,
+                finished_at,
+                lock_message_channel_id,
+                lock_message_id
+            FROM gaming_session_games
+            WHERE session_id = ?
+            ORDER BY started_at, id
+            """,
+            (int(session_id),),
+        )
+        session_games = await games_cursor.fetchall()
+
+    result = dict(row)
+    result["members"] = [
+        dict(member)
+        for member in members
+    ]
+    result["games_played"] = [
+        dict(game)
+        for game in session_games
+    ]
+    result["effective_player_count"] = int(
+        result["manual_player_count"]
+        or result["player_count"]
+        or 1
+    )
+    return result
+
+
+async def get_active_gaming_session_for_voice(
+    guild_id: int,
+    voice_channel_id: int,
+) -> dict | None:
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT id
+            FROM gaming_sessions
+            WHERE
+                guild_id = ?
+                AND voice_channel_id = ?
+                AND status IN ('starting', 'active')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (
+                int(guild_id),
+                int(voice_channel_id),
+            ),
+        )
+        row = await cursor.fetchone()
+
+    if row is None:
+        return None
+
+    return await get_gaming_session(
+        int(row["id"])
+    )
+
+
+async def get_active_gaming_sessions() -> list[dict]:
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT id
+            FROM gaming_sessions
+            WHERE status IN ('starting', 'active')
+            ORDER BY id
+            """
+        )
+        rows = await cursor.fetchall()
+
+    sessions = []
+
+    for row in rows:
+        session = await get_gaming_session(
+            int(row["id"])
+        )
+
+        if session is not None:
+            sessions.append(session)
+
+    return sessions
+
+
+async def replace_gaming_session_members(
+    session_id: int,
+    members: list[tuple[int, str]],
+) -> dict | None:
+    now = utc_now_iso()
+    unique_members = {
+        int(user_id): str(display_name)
+        for user_id, display_name in members
+    }
+    player_count = max(
+        len(unique_members),
+        1,
+    )
+
+    async with database_connection() as db:
+        try:
+            await db.execute(
+                """
+                DELETE FROM gaming_session_members
+                WHERE session_id = ?
+                """,
+                (int(session_id),),
+            )
+            await db.executemany(
+                """
+                INSERT INTO gaming_session_members (
+                    session_id,
+                    user_id,
+                    display_name,
+                    joined_at,
+                    source
+                )
+                VALUES (?, ?, ?, ?, 'voice')
+                """,
+                (
+                    (
+                        int(session_id),
+                        user_id,
+                        display_name,
+                        now,
+                    )
+                    for user_id, display_name
+                    in unique_members.items()
+                ),
+            )
+            await db.execute(
+                """
+                UPDATE gaming_sessions
+                SET
+                    player_count = ?,
+                    cache_generation = cache_generation + 1
+                WHERE id = ? AND status = 'active'
+                """,
+                (
+                    player_count,
+                    int(session_id),
+                ),
+            )
+            await db.commit()
+
+        except Exception:
+            await db.rollback()
+            raise
+
+    return await get_gaming_session(session_id)
+
+
+async def add_gaming_session_member(
+    session_id: int,
+    *,
+    user_id: int,
+    display_name: str,
+) -> dict | None:
+    now = utc_now_iso()
+
+    async with database_connection() as db:
+        await db.execute(
+            """
+            INSERT INTO gaming_session_members (
+                session_id,
+                user_id,
+                display_name,
+                joined_at,
+                source
+            )
+            SELECT ?, ?, ?, ?, 'button'
+            WHERE EXISTS (
+                SELECT 1
+                FROM gaming_sessions
+                WHERE id = ? AND status = 'active'
+            )
+            ON CONFLICT(session_id, user_id)
+            DO UPDATE SET display_name = excluded.display_name
+            """,
+            (
+                int(session_id),
+                int(user_id),
+                str(display_name),
+                now,
+                int(session_id),
+            ),
+        )
+        await db.commit()
+
+    return await get_gaming_session(session_id)
+
+
+async def remove_gaming_session_member(
+    session_id: int,
+    *,
+    user_id: int,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            DELETE FROM gaming_session_members
+            WHERE session_id = ? AND user_id = ?
+            """,
+            (
+                int(session_id),
+                int(user_id),
+            ),
+        )
+        await db.commit()
+
+    return await get_gaming_session(session_id)
+
+
+async def configure_gaming_session(
+    session_id: int,
+    *,
+    manual_player_count: int | None = None,
+    clear_manual_player_count: bool = False,
+    include_unverified: bool | None = None,
+    use_normal_wheel: bool | None = None,
+) -> dict | None:
+    assignments = [
+        "cache_generation = cache_generation + 1"
+    ]
+    parameters = []
+
+    if clear_manual_player_count:
+        assignments.append(
+            "manual_player_count = NULL"
+        )
+    elif manual_player_count is not None:
+        assignments.append(
+            "manual_player_count = ?"
+        )
+        parameters.append(
+            max(int(manual_player_count), 1)
+        )
+
+    if include_unverified is not None:
+        assignments.append(
+            "include_unverified = ?"
+        )
+        parameters.append(
+            int(bool(include_unverified))
+        )
+
+    if use_normal_wheel is not None:
+        assignments.append(
+            "use_normal_wheel = ?"
+        )
+        parameters.append(
+            int(bool(use_normal_wheel))
+        )
+
+    parameters.append(
+        int(session_id)
+    )
+
+    async with database_connection() as db:
+        await db.execute(
+            f"""
+            UPDATE gaming_sessions
+            SET {', '.join(assignments)}
+            WHERE id = ? AND status = 'active'
+            """,
+            tuple(parameters),
+        )
+        await db.commit()
+
+    return await get_gaming_session(session_id)
+
+
+async def select_gaming_session_game(
+    session_id: int,
+    *,
+    selected_by_id: int,
+    selected_by_name: str,
+    game_id: int | None = None,
+    custom_name: str | None = None,
+    custom_link: str | None = None,
+    custom_store: str | None = None,
+    custom_image_url: str | None = None,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            UPDATE gaming_sessions
+            SET
+                selected_game_id = ?,
+                custom_game_name = ?,
+                custom_game_link = ?,
+                custom_game_store = ?,
+                custom_game_image_url = ?,
+                selected_by_id = ?,
+                selected_by_name = ?
+            WHERE id = ? AND status = 'active'
+            """,
+            (
+                int(game_id) if game_id is not None else None,
+                _clean_optional_text(custom_name),
+                _clean_optional_text(custom_link),
+                _clean_optional_text(custom_store),
+                _clean_optional_text(custom_image_url),
+                int(selected_by_id),
+                str(selected_by_name),
+                int(session_id),
+            ),
+        )
+        await db.commit()
+
+    return await get_gaming_session(session_id)
+
+
+async def start_gaming_session_game(
+    session_id: int,
+    *,
+    game_name: str,
+    game_id: int | None = None,
+    game_link: str | None = None,
+    selected_by_id: int | None = None,
+    selected_by_name: str | None = None,
+) -> dict | None:
+    """Start one timeline entry for the game currently locked in."""
+
+    now = utc_now_iso()
+
+    async with database_connection() as db:
+        try:
+            await db.execute(
+                """
+                UPDATE gaming_session_games
+                SET finished_at = ?
+                WHERE session_id = ? AND finished_at IS NULL
+                """,
+                (now, int(session_id)),
+            )
+            await db.execute(
+                """
+                INSERT INTO gaming_session_games (
+                    session_id,
+                    game_id,
+                    game_name,
+                    game_link,
+                    selected_by_id,
+                    selected_by_name,
+                    started_at
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM gaming_sessions
+                    WHERE id = ? AND status = 'active'
+                )
+                """,
+                (
+                    int(session_id),
+                    int(game_id) if game_id is not None else None,
+                    str(game_name),
+                    _clean_optional_text(game_link),
+                    (
+                        int(selected_by_id)
+                        if selected_by_id is not None
+                        else None
+                    ),
+                    _clean_optional_text(selected_by_name),
+                    now,
+                    int(session_id),
+                ),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+    return await get_gaming_session(session_id)
+
+
+async def finish_gaming_session_game(
+    session_id: int,
+) -> dict | None:
+    """Finish and return the active timeline entry, if one exists."""
+
+    now = utc_now_iso()
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM gaming_session_games
+            WHERE session_id = ? AND finished_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(session_id),),
+        )
+        row = await cursor.fetchone()
+
+        if row is None:
+            return None
+
+        await db.execute(
+            """
+            UPDATE gaming_session_games
+            SET finished_at = ?
+            WHERE id = ?
+            """,
+            (now, int(row["id"])),
+        )
+        await db.commit()
+        result = dict(row)
+        result["finished_at"] = now
+        return result
+
+
+async def save_gaming_session_game_lock_message(
+    session_id: int,
+    *,
+    channel_id: int,
+    message_id: int,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            UPDATE gaming_session_games
+            SET lock_message_channel_id = ?, lock_message_id = ?
+            WHERE id = (
+                SELECT id
+                FROM gaming_session_games
+                WHERE session_id = ? AND finished_at IS NULL
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            """,
+            (
+                int(channel_id),
+                int(message_id),
+                int(session_id),
+            ),
+        )
+        await db.commit()
+
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM gaming_session_games
+            WHERE session_id = ? AND finished_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(session_id),),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+
+async def cancel_gaming_session_game(
+    session_id: int,
+) -> dict | None:
+    """Discard the unfinished timeline entry when a lock-in is cancelled."""
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM gaming_session_games
+            WHERE session_id = ? AND finished_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (int(session_id),),
+        )
+        row = await cursor.fetchone()
+        await db.execute(
+            """
+            DELETE FROM gaming_session_games
+            WHERE session_id = ? AND finished_at IS NULL
+            """,
+            (int(session_id),),
+        )
+        await db.commit()
+        return dict(row) if row is not None else None
+
+
+async def transfer_gaming_session_host(
+    session_id: int,
+    *,
+    user_id: int,
+    display_name: str,
+) -> dict | None:
+    """Transfer an active session to one of its joined members."""
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            UPDATE gaming_sessions
+            SET host_id = ?, host_name = ?
+            WHERE
+                id = ?
+                AND status = 'active'
+                AND EXISTS (
+                    SELECT 1
+                    FROM gaming_session_members
+                    WHERE session_id = ? AND user_id = ?
+                )
+            """,
+            (
+                int(user_id),
+                str(display_name),
+                int(session_id),
+                int(session_id),
+                int(user_id),
+            ),
+        )
+        await db.commit()
+
+        if cursor.rowcount == 0:
+            return None
+
+    return await get_gaming_session(session_id)
+
+
+async def clear_gaming_session_selection(
+    session_id: int,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            UPDATE gaming_sessions
+            SET
+                selected_game_id = NULL,
+                custom_game_name = NULL,
+                custom_game_link = NULL,
+                custom_game_store = NULL,
+                custom_game_image_url = NULL,
+                selected_by_id = NULL,
+                selected_by_name = NULL,
+                cache_generation = cache_generation + 1
+            WHERE id = ? AND status = 'active'
+            """,
+            (int(session_id),),
+        )
+        await db.commit()
+
+    return await get_gaming_session(session_id)
+
+
+async def end_gaming_session(
+    session_id: int,
+) -> dict | None:
+    now = utc_now_iso()
+
+    async with database_connection() as db:
+        try:
+            await db.execute(
+                """
+                UPDATE gaming_session_games
+                SET finished_at = ?
+                WHERE session_id = ? AND finished_at IS NULL
+                """,
+                (now, int(session_id)),
+            )
+            await db.execute(
+                """
+                UPDATE gaming_sessions
+                SET status = 'ended', ended_at = ?
+                WHERE id = ? AND status IN ('starting', 'active')
+                """,
+                (
+                    now,
+                    int(session_id),
+                ),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+
+    return await get_gaming_session(session_id)
+
+
 def _create_automatic_backup_sync(
     *,
     minimum_interval_hours: float,
@@ -3270,7 +5049,12 @@ async def delete_game_by_name(
     async with database_connection() as db:
         cursor = await db.execute(
             """
-            SELECT id
+            SELECT
+                id,
+                name,
+                store_link,
+                store,
+                external_id
             FROM games
             WHERE name = ? COLLATE NOCASE
             LIMIT 1
@@ -3283,11 +5067,45 @@ async def delete_game_by_name(
         if not row:
             return False
 
-        game_id = row[0]
+        (
+            game_id,
+            stored_name,
+            store_link,
+            store,
+            external_id,
+        ) = row
+
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO removed_games (
+                name,
+                store,
+                store_link,
+                external_id,
+                removed_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                stored_name,
+                store,
+                store_link,
+                external_id,
+                utc_now_iso(),
+            ),
+        )
 
         await db.execute(
             """
             DELETE FROM game_history
+            WHERE game_id = ?
+            """,
+            (game_id,),
+        )
+
+        await db.execute(
+            """
+            DELETE FROM store_replacements
             WHERE game_id = ?
             """,
             (game_id,),
@@ -3303,3 +5121,340 @@ async def delete_game_by_name(
 
         await db.commit()
         return True
+
+
+def _game_night_week_from_row(row) -> dict | None:
+    if row is None:
+        return None
+
+    record = dict(row)
+
+    for column_name in (
+        "reminder_24h_sent",
+        "reminder_6h_sent",
+        "reminder_1h_sent",
+        "checkin_closed",
+    ):
+        record[column_name] = bool(
+            record.get(column_name)
+        )
+
+    return record
+
+
+async def get_game_night_week(
+    week_start: str,
+) -> dict | None:
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT *
+            FROM game_night_weeks
+            WHERE week_start = ?
+            LIMIT 1
+            """,
+            (str(week_start),),
+        )
+        return _game_night_week_from_row(
+            await cursor.fetchone()
+        )
+
+
+async def save_game_night_poll(
+    *,
+    week_start: str,
+    channel_id: int,
+    message_id: int,
+    created_at: str,
+    closes_at: str,
+) -> dict:
+    now = utc_now_iso()
+
+    async with database_connection() as db:
+        await db.execute(
+            """
+            INSERT INTO game_night_weeks (
+                week_start,
+                poll_channel_id,
+                poll_message_id,
+                poll_created_at,
+                poll_closes_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(week_start) DO UPDATE SET
+                poll_channel_id = excluded.poll_channel_id,
+                poll_message_id = excluded.poll_message_id,
+                poll_created_at = excluded.poll_created_at,
+                poll_closes_at = excluded.poll_closes_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(week_start),
+                int(channel_id),
+                int(message_id),
+                str(created_at),
+                str(closes_at),
+                now,
+                now,
+            ),
+        )
+        await db.commit()
+
+    record = await get_game_night_week(
+        week_start
+    )
+    assert record is not None
+    return record
+
+
+async def save_game_night_result(
+    *,
+    week_start: str,
+    winner_day: str,
+    winner_reason: str,
+    friday_votes: int,
+    saturday_votes: int,
+    scheduled_event_id: int,
+    event_start_at: str,
+) -> dict:
+    now = utc_now_iso()
+
+    async with database_connection() as db:
+        await db.execute(
+            """
+            INSERT INTO game_night_weeks (
+                week_start,
+                winner_day,
+                winner_reason,
+                friday_votes,
+                saturday_votes,
+                scheduled_event_id,
+                event_start_at,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(week_start) DO UPDATE SET
+                winner_day = excluded.winner_day,
+                winner_reason = excluded.winner_reason,
+                friday_votes = excluded.friday_votes,
+                saturday_votes = excluded.saturday_votes,
+                scheduled_event_id = excluded.scheduled_event_id,
+                event_start_at = excluded.event_start_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(week_start),
+                str(winner_day),
+                str(winner_reason),
+                max(0, int(friday_votes)),
+                max(0, int(saturday_votes)),
+                int(scheduled_event_id),
+                str(event_start_at),
+                now,
+                now,
+            ),
+        )
+        await db.commit()
+
+    record = await get_game_night_week(
+        week_start
+    )
+    assert record is not None
+    return record
+
+
+_GAME_NIGHT_REMINDER_COLUMNS = {
+    24: "reminder_24h_sent",
+    6: "reminder_6h_sent",
+    1: "reminder_1h_sent",
+}
+
+
+async def set_game_night_reminders(
+    week_start: str,
+    reminder_hours,
+    *,
+    sent: bool,
+) -> None:
+    columns = []
+
+    for raw_hours in reminder_hours:
+        hours = int(raw_hours)
+        column_name = _GAME_NIGHT_REMINDER_COLUMNS.get(
+            hours
+        )
+
+        if column_name is None:
+            raise ValueError(
+                f"Unsupported game-night reminder: {hours}h"
+            )
+
+        if column_name not in columns:
+            columns.append(column_name)
+
+    if not columns:
+        return
+
+    assignments = ", ".join(
+        f"{column_name} = ?"
+        for column_name in columns
+    )
+    value = 1 if sent else 0
+
+    async with database_connection() as db:
+        await db.execute(
+            f"""
+            UPDATE game_night_weeks
+            SET
+                {assignments},
+                updated_at = ?
+            WHERE week_start = ?
+            """,
+            (
+                *([value] * len(columns)),
+                utc_now_iso(),
+                str(week_start),
+            ),
+        )
+        await db.commit()
+
+
+async def save_game_night_checkin_message(
+    week_start: str,
+    *,
+    channel_id: int,
+    message_id: int,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            UPDATE game_night_weeks
+            SET
+                checkin_channel_id = ?,
+                checkin_message_id = ?,
+                checkin_closed = 0,
+                updated_at = ?
+            WHERE week_start = ?
+            """,
+            (
+                int(channel_id),
+                int(message_id),
+                utc_now_iso(),
+                str(week_start),
+            ),
+        )
+        await db.commit()
+
+    return await get_game_night_week(week_start)
+
+
+async def set_game_night_checkin(
+    week_start: str,
+    *,
+    user_id: int,
+    display_name: str,
+    response: str,
+) -> dict | None:
+    clean_response = str(response)
+
+    if clean_response not in {
+        "playing",
+        "maybe",
+        "cant_make_it",
+    }:
+        raise ValueError("Unsupported Game Night check-in response")
+
+    async with database_connection() as db:
+        week_cursor = await db.execute(
+            """
+            SELECT checkin_closed
+            FROM game_night_weeks
+            WHERE week_start = ?
+            """,
+            (str(week_start),),
+        )
+        week = await week_cursor.fetchone()
+
+        if week is None or bool(week["checkin_closed"]):
+            return None
+
+        await db.execute(
+            """
+            INSERT INTO game_night_checkins (
+                week_start,
+                user_id,
+                display_name,
+                response,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(week_start, user_id) DO UPDATE SET
+                display_name = excluded.display_name,
+                response = excluded.response,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(week_start),
+                int(user_id),
+                str(display_name),
+                clean_response,
+                utc_now_iso(),
+            ),
+        )
+        await db.commit()
+
+    return await get_game_night_checkins(week_start)
+
+
+async def get_game_night_checkins(
+    week_start: str,
+) -> dict:
+    responses = {
+        "playing": [],
+        "maybe": [],
+        "cant_make_it": [],
+    }
+
+    async with database_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT user_id, display_name, response, updated_at
+            FROM game_night_checkins
+            WHERE week_start = ?
+            ORDER BY updated_at, user_id
+            """,
+            (str(week_start),),
+        )
+        rows = await cursor.fetchall()
+
+    for row in rows:
+        responses[str(row["response"])].append(dict(row))
+
+    return {
+        "responses": responses,
+        "counts": {
+            response: len(members)
+            for response, members in responses.items()
+        },
+        "total": len(rows),
+    }
+
+
+async def close_game_night_checkin(
+    week_start: str,
+) -> dict | None:
+    async with database_connection() as db:
+        await db.execute(
+            """
+            UPDATE game_night_weeks
+            SET checkin_closed = 1, updated_at = ?
+            WHERE week_start = ?
+            """,
+            (utc_now_iso(), str(week_start)),
+        )
+        await db.commit()
+
+    return await get_game_night_week(week_start)
