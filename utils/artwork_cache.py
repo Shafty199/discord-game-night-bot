@@ -50,7 +50,8 @@ _local_card_locks: dict[
     int,
     asyncio.Lock,
 ] = {}
-_artwork_preparation_semaphore = asyncio.Semaphore(1)
+_artwork_download_semaphore = asyncio.Semaphore(5)
+_artwork_image_semaphore = asyncio.Semaphore(2)
 _manifest_lock = asyncio.Lock()
 _manifest_cache: dict | None = None
 _manifest_dirty = False
@@ -411,9 +412,7 @@ async def _delayed_manifest_flush() -> None:
 def _verify_artwork_file(artwork_path: Path) -> bool:
     try:
         with Image.open(artwork_path) as artwork:
-            artwork.verify()
-
-        with Image.open(artwork_path) as artwork:
+            artwork.load()
             return (
                 artwork.width > 0
                 and artwork.height > 0
@@ -522,6 +521,17 @@ def _write_local_artwork(
 
 
 async def _download_artwork(
+    session: aiohttp.ClientSession,
+    image_url: str,
+) -> bytes:
+    async with _artwork_download_semaphore:
+        return await _download_artwork_unlimited(
+            session,
+            image_url,
+        )
+
+
+async def _download_artwork_unlimited(
     session: aiohttp.ClientSession,
     image_url: str,
 ) -> bytes:
@@ -635,11 +645,12 @@ async def ensure_local_artwork(
                     image_url,
                 )
 
-            await asyncio.to_thread(
-                _write_local_artwork,
-                local_image_data,
-                artwork_path,
-            )
+            async with _artwork_image_semaphore:
+                await asyncio.to_thread(
+                    _write_local_artwork,
+                    local_image_data,
+                    artwork_path,
+                )
             await _record_manifest_entry(
                 game_id=clean_game_id,
                 image_url=image_url,
@@ -714,12 +725,11 @@ async def prepare_local_game_card(
     )
 
     async with lock:
-        async with _artwork_preparation_semaphore:
-            return await _prepare_local_game_card(
-                session=session,
-                game_record=game_record,
-                refresh=refresh,
-            )
+        return await _prepare_local_game_card(
+            session=session,
+            game_record=game_record,
+            refresh=refresh,
+        )
 
 
 async def _prepare_local_game_card(
@@ -823,15 +833,16 @@ async def _prepare_local_game_card(
         if prepared_path is None:
             return "failed"
 
-        card_path = await asyncio.to_thread(
-            prepare_static_game_card,
-            {
-                "id": game_record.get("id"),
-                "name": game_record.get("name"),
-                "store": game_record.get("store"),
-                "artwork_path": str(prepared_path),
-            },
-        )
+        async with _artwork_image_semaphore:
+            card_path = await asyncio.to_thread(
+                prepare_static_game_card,
+                {
+                    "id": game_record.get("id"),
+                    "name": game_record.get("name"),
+                    "store": game_record.get("store"),
+                    "artwork_path": str(prepared_path),
+                },
+            )
 
         if (
             card_path is None
