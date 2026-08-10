@@ -1,5 +1,12 @@
 {
   "suggestion_thread_id": "123456789012345678",
+  "session_channel_id": "123456789012345678",
+  "session_notify_role_id": "123456789012345678",
+  "logging_channel_id": "123456789012345678",
+  "game_night_channel_id": "123456789012345678",
+  "game_night_role_id": "123456789012345678",
+  "game_night_voice_channel_id": "123456789012345678",
+  "game_night_timezone": "UTC",
   "display_timezone_offset": "+00:00",
   "steam_country_code": "US",
   "steam_language": "english",

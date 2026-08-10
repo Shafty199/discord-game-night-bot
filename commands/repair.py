@@ -15,11 +15,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from settings import (
-    STEAM_COUNTRY_CODE,
-    STEAM_LANGUAGE,
-    STORE_ACCEPT_LANGUAGE,
-)
 from database.database import (
     database_connection,
     save_store_replacement,
@@ -65,7 +60,7 @@ REPAIR_REQUEST_HEADERS = {
         "text/html,application/xhtml+xml,"
         "application/json;q=0.9,*/*;q=0.8"
     ),
-    "Accept-Language": STORE_ACCEPT_LANGUAGE,
+    "Accept-Language": "en-AU,en;q=0.9",
 }
 
 INVALID_GAME_TITLES = {
@@ -757,8 +752,8 @@ async def search_steam_app_ids(
     params = {
         "term": clean_term,
         "f": "games",
-        "cc": STEAM_COUNTRY_CODE,
-        "l": STEAM_LANGUAGE,
+        "cc": "AU",
+        "l": "english",
         "use_store_query": "1",
         "use_search_spellcheck": "1",
         "search_creators_and_tags": "1",

@@ -779,5 +779,184 @@ class DatabaseMaintenanceTests(
         )
 
 
+    async def test_add_game_details_include_saved_record_and_artwork_change(self):
+        common = {
+            "name": "Detailed Sync Game",
+            "store_link": (
+                "https://store.steampowered.com/app/2468/"
+            ),
+            "store": "Steam",
+            "suggested_by": "Tester",
+            "external_id": "2468",
+            "link_status": "live",
+        }
+
+        added = await database.add_game(
+            **common,
+            image_url="https://example.com/first.jpg",
+            return_details=True,
+        )
+        unchanged = await database.add_game(
+            **common,
+            image_url="https://example.com/first.jpg",
+            return_details=True,
+        )
+        updated = await database.add_game(
+            **common,
+            image_url="https://example.com/second.jpg",
+            return_details=True,
+        )
+
+        self.assertEqual(added["status"], "added")
+        self.assertIsNotNone(added["game_id"])
+        self.assertEqual(
+            added["record"]["id"],
+            added["game_id"],
+        )
+        self.assertTrue(added["artwork_changed"])
+
+        self.assertEqual(
+            unchanged["status"],
+            "unchanged",
+        )
+        self.assertEqual(
+            unchanged["game_id"],
+            added["game_id"],
+        )
+        self.assertFalse(
+            unchanged["artwork_changed"]
+        )
+
+        self.assertEqual(updated["status"], "updated")
+        self.assertEqual(
+            updated["record"]["image_url"],
+            "https://example.com/second.jpg",
+        )
+        self.assertTrue(updated["artwork_changed"])
+
+
+    async def test_daily_igdb_candidates_only_include_incomplete_games(
+        self,
+    ):
+        await database.sync_game(
+            name="Missing IGDB Game",
+            store_link=(
+                "https://store.steampowered.com/app/111/"
+            ),
+            store="Steam",
+            suggested_by="Tester",
+            external_id="111",
+            link_status="live",
+        )
+        await database.sync_game(
+            name="Complete Without IGDB ID",
+            store_link=(
+                "https://store.steampowered.com/app/222/"
+            ),
+            store="Steam",
+            suggested_by="Tester",
+            external_id="222",
+            link_status="live",
+            max_players=4,
+            max_players_source="Steam",
+            multiplayer_support={
+                "online_coop": True,
+                "online_coop_max": 4,
+            },
+            genres=["Adventure"],
+            game_modes=["Multiplayer"],
+        )
+        await database.sync_game(
+            name="Wishlist Without IGDB ID",
+            store_link=(
+                "https://store.steampowered.com/app/333/"
+            ),
+            store="Steam",
+            suggested_by="Tester",
+            external_id="333",
+            link_status="live",
+            availability_status="coming_soon",
+            coming_soon=True,
+        )
+
+        candidates = (
+            await database.get_games_missing_igdb_metadata()
+        )
+
+        self.assertEqual(
+            [game["name"] for game in candidates],
+            ["Missing IGDB Game"],
+        )
+        self.assertIsNone(
+            candidates[0]["multiplayer_support"]
+        )
+        self.assertIsNone(candidates[0]["genres"])
+
+    async def test_daily_igdb_refresh_preserves_steam_limit(
+        self,
+    ):
+        await database.sync_game(
+            name="Daily IGDB Game",
+            store_link=(
+                "https://store.steampowered.com/app/444/"
+            ),
+            store="Steam",
+            suggested_by="Tester",
+            external_id="444",
+            link_status="live",
+            max_players=6,
+            max_players_source="Steam",
+        )
+        candidates = (
+            await database.get_games_missing_igdb_metadata()
+        )
+        game = candidates[0]
+        game.update(
+            {
+                "igdb_id": 9876,
+                "max_players": 8,
+                "max_players_source": "IGDB",
+                "multiplayer_support": {
+                    "online_coop": True,
+                    "online_coop_max": 8,
+                },
+                "genres": ["Adventure", "Indie"],
+                "themes": ["Comedy"],
+                "game_modes": [
+                    "Multiplayer",
+                    "Co-operative",
+                ],
+            }
+        )
+
+        changed = await database.save_refreshed_igdb_metadata(
+            game["id"],
+            game,
+        )
+        record = await database.get_game_cache_record(
+            store="Steam",
+            external_id="444",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(record["igdb_id"], 9876)
+        self.assertEqual(record["max_players"], 6)
+        self.assertEqual(
+            record["max_players_source"],
+            "Steam",
+        )
+        self.assertEqual(
+            record["genres"],
+            '["Adventure","Indie"]',
+        )
+        self.assertEqual(
+            await database.get_games_missing_igdb_metadata(),
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+

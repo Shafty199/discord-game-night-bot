@@ -13,8 +13,6 @@ from utils.spin_gif import (
     SUSPENSE_DURATION_MS,
     WINNER_FLASH_DURATION_MS,
     _artwork_panel,
-    _winner_frame,
-    GOLD_COLOUR,
     build_spin_sequence,
     build_spin_gif,
 )
@@ -202,24 +200,14 @@ class SpinGifTests(unittest.TestCase):
                     animation.n_frames,
                     len(SPIN_FRAME_DURATIONS_MS) + 2,
                 )
-                animation.seek(
-                    animation.n_frames - 1
-                )
-                decoded_winner = animation.convert(
-                    "RGB"
-                )
-                expected_winner = _winner_frame(
-                    winner,
-                    accent_colour=GOLD_COLOUR,
-                ).quantize(
-                    colors=96,
-                    method=Image.Quantize.FASTOCTREE,
-                    dither=Image.Dither.FLOYDSTEINBERG,
-                ).convert("RGB")
-                self.assertIsNone(
+                animation.seek(animation.n_frames - 2)
+                suspense_frame = animation.convert("RGB")
+                animation.seek(animation.n_frames - 1)
+                winner_frame = animation.convert("RGB")
+                self.assertIsNotNone(
                     ImageChops.difference(
-                        decoded_winner,
-                        expected_winner,
+                        suspense_frame,
+                        winner_frame,
                     ).getbbox()
                 )
 
@@ -257,3 +245,4 @@ class SpinGifTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

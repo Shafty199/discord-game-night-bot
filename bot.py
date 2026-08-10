@@ -33,9 +33,13 @@ from utils.metadata import (
     epic_info_from_embeds,
     release_info_from_embeds,
 )
+from utils.prepared_spins import PreparedSpinManager
 from utils.igdb import (
     enrich_missing_player_metadata,
     igdb_is_configured,
+)
+from utils.logging_filters import (
+    DiscordOptionalVoiceWarningFilter,
 )
 from utils.store import (
     clear_store_metadata_cache,
@@ -59,8 +63,15 @@ logging.getLogger(
 ).setLevel(
     logging.WARNING
 )
+logging.getLogger(
+    "discord.client"
+).addFilter(
+    DiscordOptionalVoiceWarningFilter()
+)
 
 LOGGER = logging.getLogger(__name__)
+
+SUGGESTION_ARTWORK_CONCURRENCY = 3
 
 
 TOKEN = DISCORD_TOKEN
@@ -137,6 +148,7 @@ class GameNightBot(commands.Bot):
     maintenance_lock: asyncio.Lock | None = None
     suggestion_queue: asyncio.Queue | None = None
     suggestion_worker_task: asyncio.Task | None = None
+    prepared_spin_manager: PreparedSpinManager | None = None
 
     async def setup_hook(self):
         asyncio.get_running_loop().set_exception_handler(
@@ -205,6 +217,8 @@ class GameNightBot(commands.Bot):
             "commands.repair",
             "commands.wishlist",
             "commands.maintenance",
+            "commands.sessions",
+            "commands.events",
         )
 
         for extension in extensions:
@@ -252,6 +266,11 @@ class GameNightBot(commands.Bot):
                 "Slash-command definitions are unchanged; "
                 "Discord sync skipped"
             )
+
+        self.prepared_spin_manager = PreparedSpinManager(
+            self
+        )
+        self.prepared_spin_manager.start()
 
     def queue_suggestion(self, message) -> bool:
         message_key = (
@@ -355,6 +374,10 @@ class GameNightBot(commands.Bot):
             ):
                 await self.suggestion_worker_task
 
+        if self.prepared_spin_manager is not None:
+            await self.prepared_spin_manager.close()
+            self.prepared_spin_manager = None
+
         try:
             await flush_artwork_manifest()
 
@@ -392,6 +415,11 @@ async def on_ready():
         "Logged in as %s; Game Night Bot is online",
         bot.user,
     )
+
+    sessions_cog = bot.get_cog("Sessions")
+
+    if sessions_cog is not None:
+        await sessions_cog.restore_active_sessions()
 
 @bot.event
 async def on_error(
@@ -505,6 +533,62 @@ def get_store_display(
     return f"🎮 {cleaned_store}"
 
 
+async def _prepare_suggestion_artwork_jobs(
+    bot_instance,
+    artwork_jobs: list[tuple[dict, dict, bool]],
+) -> None:
+    """Prepare suggestion artwork concurrently within a safe limit."""
+
+    if not artwork_jobs:
+        return
+
+    artwork_limit = asyncio.Semaphore(
+        SUGGESTION_ARTWORK_CONCURRENCY
+    )
+
+    async def prepare_job(
+        game_info: dict,
+        game_record: dict,
+        refresh: bool,
+    ) -> None:
+        try:
+            async with artwork_limit:
+                cache_result = (
+                    await prepare_local_game_artwork(
+                        bot=bot_instance,
+                        game_record=game_record,
+                        refresh=refresh,
+                    )
+                )
+
+        except Exception:
+            LOGGER.exception(
+                "Could not prepare suggestion artwork for %s",
+                game_record.get(
+                    "name",
+                    "Unknown Game",
+                ),
+            )
+            cache_result = "failed"
+
+        game_info["cache_result"] = cache_result
+
+    await asyncio.gather(
+        *(
+            prepare_job(
+                game_info,
+                game_record,
+                refresh,
+            )
+            for (
+                game_info,
+                game_record,
+                refresh,
+            ) in artwork_jobs
+        )
+    )
+
+
 async def _process_suggestion_message(
     message,
 ):
@@ -598,7 +682,9 @@ async def _process_suggestion_message(
         added_games = []
         wishlisted_games = []
         existing_games = []
+        removed_games = []
         failed_links = []
+        artwork_jobs = []
 
         for store_link in store_links:
             game_info = lookup_results.get(
@@ -830,7 +916,7 @@ async def _process_suggestion_message(
                     "release_date"
                 ]
 
-            result = await add_game(
+            sync_result = await add_game(
                 name=game_info["name"],
                 store_link=game_info["store_link"],
                 store=game_info["store"],
@@ -870,36 +956,26 @@ async def _process_suggestion_message(
                 max_players_source=game_info.get(
                     "max_players_source"
                 ),
-                return_status=True,
+                return_details=True,
             )
-
-            game_record = await get_game_cache_record(
-                name=game_info.get(
-                    "name"
-                ),
-                store=game_info.get(
-                    "store"
-                ),
-                store_link=game_info.get(
-                    "store_link"
-                ),
-                external_id=game_info.get(
-                    "external_id"
-                ),
+            result = sync_result["status"]
+            game_record = sync_result.get(
+                "record"
             )
-
-            cache_result = None
+            game_info["cache_result"] = None
 
             if game_record:
-                cache_result = await prepare_local_game_artwork(
-                    bot=bot,
-                    game_record=game_record,
-                    refresh=True,
+                artwork_jobs.append(
+                    (
+                        game_info,
+                        game_record,
+                        bool(
+                            sync_result.get(
+                                "artwork_changed"
+                            )
+                        ),
+                    )
                 )
-
-            game_info[
-                "cache_result"
-            ] = cache_result
 
             if result == "added":
                 added_games.append(
@@ -915,15 +991,26 @@ async def _process_suggestion_message(
                     game_info
                 )
 
+            elif result == "removed":
+                removed_games.append(
+                    game_info
+                )
+
             else:
                 existing_games.append(
                     game_info
                 )
 
+        await _prepare_suggestion_artwork_jobs(
+            bot,
+            artwork_jobs,
+        )
+
         if (
             added_games
             or wishlisted_games
             or existing_games
+            or removed_games
             or failed_links
         ):
             reply_lines = []
@@ -1043,6 +1130,13 @@ async def _process_suggestion_message(
                     f"{epic_note}"
                 )
 
+            for game in removed_games:
+                reply_lines.append(
+                    f"🗑️ **{game['name']}** was previously "
+                    "removed by a moderator, so it was not "
+                    "added back to either wheel."
+                )
+
             for failed_link in failed_links:
                 reply_lines.append(
                     "❌ I couldn't read this store link:\n"
@@ -1086,13 +1180,6 @@ async def ping(
 if not TOKEN:
     raise RuntimeError(
         "DISCORD_TOKEN was not found in the .env file."
-    )
-
-if SUGGESTION_THREAD_ID is None:
-    raise RuntimeError(
-        "SUGGESTION_THREAD_ID was not found. Copy "
-        "config.example.json to config.json and add your "
-        "Discord suggestion thread ID, or set it in .env."
     )
 
 

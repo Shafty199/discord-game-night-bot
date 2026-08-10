@@ -654,6 +654,196 @@ class UndoLastGameView(discord.ui.View):
         self._disable_buttons()
 
 
+async def _resolve_game_selection(
+    selection: str,
+) -> dict | None:
+    clean_selection = str(selection or "").strip()
+
+    if clean_selection.casefold().startswith("id:"):
+        try:
+            selected_id = int(
+                clean_selection.split(":", 1)[1]
+            )
+        except (TypeError, ValueError):
+            return None
+
+        records = await get_all_game_cache_records()
+        return next(
+            (
+                record
+                for record in records
+                if int(record["id"]) == selected_id
+            ),
+            None,
+        )
+
+    return await get_game_cache_record(
+        name=clean_selection
+    )
+
+
+async def _remove_game_record(
+    *,
+    bot,
+    game_record: dict,
+) -> str:
+    current_record = await get_game_cache_record(
+        name=game_record["name"]
+    )
+
+    if (
+        current_record is None
+        or int(current_record["id"])
+        != int(game_record["id"])
+    ):
+        return "stale"
+
+    deleted = await delete_game_by_name(
+        game_record["name"]
+    )
+
+    if not deleted:
+        return "stale"
+
+    try:
+        await delete_local_game_artwork(
+            int(game_record["id"])
+        )
+    except Exception:
+        LOGGER.exception(
+            "Game %s was removed, but its local artwork "
+            "could not be deleted",
+            game_record["id"],
+        )
+
+    prepared_spin_manager = getattr(
+        bot,
+        "prepared_spin_manager",
+        None,
+    )
+
+    if prepared_spin_manager is not None:
+        try:
+            await prepared_spin_manager.invalidate_library()
+        except Exception:
+            LOGGER.exception(
+                "Game %s was removed, but the prepared-spin "
+                "pools could not be refreshed immediately",
+                game_record["id"],
+            )
+
+    return "removed"
+
+
+class RemoveGameView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        author_id: int,
+        bot,
+        game_record: dict,
+    ):
+        super().__init__(timeout=60)
+        self.author_id = author_id
+        self.bot = bot
+        self.game_record = game_record
+        self.completed = False
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "Only the moderator who started this removal "
+                "can use these buttons.",
+                ephemeral=True,
+            )
+            return False
+
+        return True
+
+    def _disable_buttons(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(
+        label="Remove Game",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def confirm_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.completed = True
+        self._disable_buttons()
+
+        try:
+            status = await _remove_game_record(
+                bot=self.bot,
+                game_record=self.game_record,
+            )
+        except Exception:
+            LOGGER.exception(
+                "Failed to remove game %s",
+                self.game_record["id"],
+            )
+            message = (
+                "❌ The game could not be removed. Nothing "
+                "could be confirmed; check the hosting console."
+            )
+        else:
+            if status == "stale":
+                message = (
+                    "⚠️ That game changed or was already removed "
+                    "while this confirmation was open. Nothing "
+                    "else was changed."
+                )
+            else:
+                message = (
+                    "## ✅ Game Removed\n\n"
+                    f"🎮 **{self.game_record['name']}**\n\n"
+                    "It has been removed from the game database, "
+                    "its play history and local artwork. Prepared "
+                    "wheel spins are being rebuilt without it, and "
+                    "future full syncs will not add it back."
+                )
+
+        await interaction.response.edit_message(
+            content=message,
+            view=self,
+        )
+        self.stop()
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
+        self.completed = True
+        self._disable_buttons()
+        await interaction.response.edit_message(
+            content=(
+                "Removal cancelled. The game was not changed."
+            ),
+            view=self,
+        )
+        self.stop()
+
+    async def on_timeout(self):
+        if self.completed:
+            return
+
+        self._disable_buttons()
+
+
 class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -972,6 +1162,7 @@ class Admin(commands.Cog):
         updated = 0
         unchanged = 0
         unavailable = 0
+        removed = 0
         unverified = 0
         failed = 0
 
@@ -1000,6 +1191,7 @@ class Admin(commands.Cog):
         wishlist_updated_names = []
         moved_to_wishlist_names = []
         unavailable_names = []
+        removed_names = []
         unverified_names = []
         failed_names = []
 
@@ -1888,6 +2080,13 @@ class Admin(commands.Cog):
                     report_name
                 )
 
+            elif result == "removed":
+                removed += 1
+                removed_names.append(
+                    report_name
+                )
+                continue
+
             else:
                 failed += 1
 
@@ -2127,6 +2326,10 @@ class Admin(commands.Cog):
                 "🚫 Confirmed unavailable",
             ),
             (
+                removed,
+                "🗑️ Removed games skipped",
+            ),
+            (
                 unverified,
                 "⚠️ Could not fully verify",
             ),
@@ -2253,6 +2456,10 @@ class Admin(commands.Cog):
                     unavailable_names,
                 ),
                 _format_name_section(
+                    "🗑️ Removed Games Skipped",
+                    removed_names,
+                ),
+                _format_name_section(
                     "⚠️ Could Not Fully Verify",
                     unverified_names,
                 ),
@@ -2305,74 +2512,104 @@ class Admin(commands.Cog):
         raise error
 
     @app_commands.command(
-        name="deletegame",
-        description=(
-            "Delete an incorrectly imported game"
-        ),
+        name="removegame",
+        description="Remove a game from the bot and its wheels",
     )
     @app_commands.describe(
         game_name=(
-            "The exact name of the game to delete"
+            "Start typing, then select the game to remove"
         )
     )
     @app_commands.checks.has_permissions(
         manage_guild=True
     )
-    async def deletegame(
+    async def removegame(
         self,
         interaction: discord.Interaction,
         game_name: str,
     ):
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
         try:
-            game_record = await get_game_cache_record(
-                name=game_name
-            )
-
-            deleted = await delete_game_by_name(
+            game_record = await _resolve_game_selection(
                 game_name
             )
-
-            if deleted and game_record:
-                await delete_local_game_artwork(
-                    game_record["id"],
-                )
-
         except Exception:
             LOGGER.exception(
-                "Failed to delete game %r",
+                "Failed to look up game %r for removal",
                 game_name,
             )
-
-            await interaction.followup.send(
-                "❌ The game could not be deleted. Check "
+            await interaction.response.send_message(
+                "❌ The game could not be looked up. Check "
                 "the hosting console for details.",
                 ephemeral=True,
             )
             return
 
-        if not deleted:
-            await interaction.followup.send(
+        if game_record is None:
+            await interaction.response.send_message(
                 f"❌ I could not find a game named "
                 f"**{game_name}**.\n\n"
-                "The name must exactly match the name "
-                "shown by `/games`.",
+                "Start typing its name and choose it from "
+                "the suggestions.",
                 ephemeral=True,
             )
             return
 
-        await interaction.followup.send(
-            f"✅ Deleted **{game_name}** from the "
-            "game database and removed its associated "
-            "play history.",
+        view = RemoveGameView(
+            author_id=interaction.user.id,
+            bot=self.bot,
+            game_record=game_record,
+        )
+        store = game_record.get("store") or "Unknown store"
+        await interaction.response.send_message(
+            "## ⚠️ Remove This Game?\n\n"
+            f"🎮 **{game_record['name']}**\n"
+            f"🏪 {store}\n\n"
+            "This permanently removes the game from both "
+            "wheels, deletes its play history and local artwork, "
+            "blocks it from being re-added by future syncs, and "
+            "rebuilds the prepared spin cache.",
+            view=view,
             ephemeral=True,
         )
 
-    @deletegame.error
-    async def deletegame_error(
+    @removegame.autocomplete("game_name")
+    async def removegame_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ):
+        try:
+            records = await get_all_game_cache_records()
+        except Exception:
+            LOGGER.exception(
+                "Failed to autocomplete removegame choices"
+            )
+            return []
+
+        query = str(current or "").strip().casefold()
+        matches = [
+            record
+            for record in records
+            if query in str(record.get("name") or "").casefold()
+        ]
+        matches.sort(
+            key=lambda record: (
+                not str(record.get("name") or "")
+                .casefold()
+                .startswith(query),
+                str(record.get("name") or "").casefold(),
+            )
+        )
+        return [
+            app_commands.Choice(
+                name=str(record["name"])[:100],
+                value=f"id:{record['id']}",
+            )
+            for record in matches[:25]
+        ]
+
+    @removegame.error
+    async def removegame_error(
         self,
         interaction: discord.Interaction,
         error,
@@ -2383,7 +2620,7 @@ class Admin(commands.Cog):
         ):
             message = (
                 "❌ You need moderator permissions "
-                "to use this command."
+                "to use `/removegame`."
             )
 
             if interaction.response.is_done():

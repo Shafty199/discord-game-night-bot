@@ -12,21 +12,34 @@ LOCAL_ARTWORK_CACHE_DIRECTORY = (
     DATABASE_PATH.parent / "artwork"
 )
 
-load_dotenv(PROJECT_ROOT / ".env")
+load_dotenv(
+    PROJECT_ROOT / ".env"
+)
 
 
 def _load_config() -> dict:
     try:
-        with CONFIG_PATH.open("r", encoding="utf-8") as file:
-            config = json.load(file)
+        with CONFIG_PATH.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+            config = json.load(
+                file
+            )
+
     except FileNotFoundError:
         return {}
+
     except json.JSONDecodeError as error:
         raise RuntimeError(
-            f"{CONFIG_PATH.name} contains invalid JSON: {error}"
+            f"{CONFIG_PATH.name} contains invalid JSON: "
+            f"{error}"
         ) from error
 
-    if not isinstance(config, dict):
+    if not isinstance(
+        config,
+        dict,
+    ):
         raise RuntimeError(
             f"{CONFIG_PATH.name} must contain a JSON object."
         )
@@ -57,13 +70,18 @@ def _optional_discord_id(
     *,
     setting_name: str,
 ) -> int | None:
-    cleaned_value = str(value or "").strip()
+    cleaned_value = str(
+        value or ""
+    ).strip()
 
     if not cleaned_value:
         return None
 
     try:
-        discord_id = int(cleaned_value)
+        discord_id = int(
+            cleaned_value
+        )
+
     except ValueError as error:
         raise RuntimeError(
             f"{setting_name} must be a Discord ID number."
@@ -80,35 +98,158 @@ def _optional_discord_id(
 CONFIG = _load_config()
 
 DISCORD_TOKEN = (
-    os.getenv("DISCORD_TOKEN", "").strip()
+    os.getenv(
+        "DISCORD_TOKEN",
+        "",
+    ).strip()
     or None
 )
 
 STEAMGRIDDB_API_KEY = (
-    os.getenv("STEAMGRIDDB_API_KEY", "").strip()
+    os.getenv(
+        "STEAMGRIDDB_API_KEY",
+        "",
+    ).strip()
     or None
 )
 
 IGDB_CLIENT_ID = (
-    os.getenv("IGDB_CLIENT_ID", "").strip()
+    os.getenv(
+        "IGDB_CLIENT_ID",
+        "",
+    ).strip()
     or None
 )
 
 IGDB_CLIENT_SECRET = (
-    os.getenv("IGDB_CLIENT_SECRET", "").strip()
+    os.getenv(
+        "IGDB_CLIENT_SECRET",
+        "",
+    ).strip()
     or None
 )
 
-SUGGESTION_THREAD_ID = _optional_discord_id(
+OCI_SPIN_NAMESPACE = (
+    os.getenv(
+        "OCI_SPIN_NAMESPACE",
+        "",
+    ).strip()
+    or None
+)
+
+OCI_SPIN_BUCKET = (
+    os.getenv(
+        "OCI_SPIN_BUCKET",
+        "",
+    ).strip()
+    or None
+)
+
+OCI_SPIN_REGION = (
+    os.getenv(
+        "OCI_SPIN_REGION",
+        "",
+    ).strip()
+    or None
+)
+
+SPIN_CACHE_CHANNEL_ID = _optional_discord_id(
+    os.getenv(
+        "SPIN_CACHE_CHANNEL_ID"
+    )
+    or CONFIG.get(
+        "spin_cache_channel_id"
+    ),
+    setting_name="SPIN_CACHE_CHANNEL_ID",
+)
+
+SESSION_CHANNEL_ID = _optional_discord_id(
+    os.getenv(
+        "SESSION_CHANNEL_ID"
+    )
+    or CONFIG.get(
+        "session_channel_id"
+    ),
+    setting_name="SESSION_CHANNEL_ID",
+)
+
+SESSION_NOTIFY_ROLE_ID = _optional_discord_id(
+    os.getenv(
+        "SESSION_NOTIFY_ROLE_ID"
+    )
+    or CONFIG.get(
+        "session_notify_role_id"
+    ),
+    setting_name="SESSION_NOTIFY_ROLE_ID",
+)
+
+LOGGING_CHANNEL_ID = _optional_discord_id(
+    os.getenv(
+        "LOGGING_CHANNEL_ID"
+    )
+    or CONFIG.get(
+        "logging_channel_id"
+    ),
+    setting_name="LOGGING_CHANNEL_ID",
+)
+
+GAME_NIGHT_CHANNEL_ID = _optional_discord_id(
+    os.getenv(
+        "GAME_NIGHT_CHANNEL_ID"
+    )
+    or CONFIG.get(
+        "game_night_channel_id"
+    )
+    or SESSION_CHANNEL_ID,
+    setting_name="GAME_NIGHT_CHANNEL_ID",
+)
+
+GAME_NIGHT_ROLE_ID = _optional_discord_id(
+    os.getenv(
+        "GAME_NIGHT_ROLE_ID"
+    )
+    or CONFIG.get(
+        "game_night_role_id"
+    )
+    or SESSION_NOTIFY_ROLE_ID,
+    setting_name="GAME_NIGHT_ROLE_ID",
+)
+
+GAME_NIGHT_VOICE_CHANNEL_ID = _optional_discord_id(
+    os.getenv(
+        "GAME_NIGHT_VOICE_CHANNEL_ID"
+    )
+    or CONFIG.get(
+        "game_night_voice_channel_id"
+    ),
+    setting_name="GAME_NIGHT_VOICE_CHANNEL_ID",
+)
+
+GAME_NIGHT_TIMEZONE = (
     _setting(
-        "SUGGESTION_THREAD_ID",
-        "suggestion_thread_id",
+        "GAME_NIGHT_TIMEZONE",
+        "game_night_timezone",
+        "UTC",
+    )
+    or "UTC"
+)
+
+SUGGESTION_THREAD_ID = _optional_discord_id(
+    os.getenv(
+        "SUGGESTION_THREAD_ID"
+    )
+    or CONFIG.get(
+        "suggestion_thread_id"
     ),
     setting_name="SUGGESTION_THREAD_ID",
 )
 
-# Unicode defaults work in every Discord server. Server owners may
-# override either value with a custom Discord emoji in .env.
+if SUGGESTION_THREAD_ID is None:
+    raise RuntimeError(
+        "SUGGESTION_THREAD_ID was not found in .env or "
+        "config.json."
+    )
+
 STEAM_EMOJI = _setting(
     "STEAM_EMOJI",
     "steam_emoji",
