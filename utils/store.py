@@ -2,6 +2,7 @@ import asyncio
 import copy
 import html
 import json
+import logging
 import re
 import time
 from collections import OrderedDict
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from urllib.parse import (
     unquote,
+    urlencode,
     urlparse,
     urlunparse,
 )
@@ -26,14 +28,7 @@ from utils.steam_api import fetch_steam_app_data
 from utils.time_utils import DISPLAY_TIMEZONE
 
 
-STEAM_STORE_HOST = "store.steampowered.com"
-EPIC_STORE_HOST = "store.epicgames.com"
-EPIC_STORE_HOSTS = frozenset(
-    {
-        EPIC_STORE_HOST,
-        "www.epicgames.com",
-    }
-)
+LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_LINK_PATTERN = re.compile(
     r"https?://[^\s<>()]+",
@@ -57,6 +52,21 @@ STEAM_STORE_ITEMS_URL = (
     "https://api.steampowered.com/"
     "IStoreBrowseService/GetItems/v1/"
 )
+STEAM_SEARCH_SUGGEST_URL = (
+    "https://store.steampowered.com/search/suggest"
+)
+STEAM_SEARCH_TIMEOUT = aiohttp.ClientTimeout(
+    total=20,
+    connect=7,
+)
+STEAM_SEARCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 GameNightDiscordBot/1.0 "
+        "(Steam title lookup)"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": STORE_ACCEPT_LANGUAGE,
+}
 STEAM_RELATIVE_UNLOCK_PATTERN = re.compile(
     r"\bthis game plans to unlock in "
     r"approximately\s+(\d+(?:\.\d+)?)\s+"
@@ -115,53 +125,126 @@ class OpenGraphParser(HTMLParser):
             self.image = cleaned_content
 
 
-class PlainTextHTMLParser(HTMLParser):
-    IGNORED_CONTENT_TAGS = {
-        "script",
-        "style",
-    }
-
+class SteamTitleSearchParser(HTMLParser):
     def __init__(self):
-        super().__init__(
-            convert_charrefs=True,
+        super().__init__()
+        self.app_ids = []
+        self._seen = set()
+
+    def handle_starttag(self, tag, attrs):
+        attributes = {
+            str(key).lower(): value
+            for key, value in attrs
+            if key and value is not None
+        }
+        candidate_values = (
+            attributes.get("data-ds-appid"),
+            attributes.get("data-appid"),
+            attributes.get("data-ds-itemkey"),
+            attributes.get("href"),
         )
-        self.parts = []
-        self.ignored_depth = 0
 
-    def handle_starttag(
-        self,
-        tag,
-        attrs,
-    ):
-        if tag.casefold() in self.IGNORED_CONTENT_TAGS:
-            self.ignored_depth += 1
-
-    def handle_endtag(
-        self,
-        tag,
-    ):
-        if (
-            tag.casefold() in self.IGNORED_CONTENT_TAGS
-            and self.ignored_depth
-        ):
-            self.ignored_depth -= 1
-
-    def handle_data(
-        self,
-        data,
-    ):
-        if (
-            not self.ignored_depth
-            and data
-        ):
-            self.parts.append(
-                data
+        for value in candidate_values:
+            text = str(value or "")
+            direct_match = re.fullmatch(
+                r"\d+",
+                text,
+            )
+            link_match = STEAM_APP_PATTERN.search(text)
+            item_match = re.search(
+                r"(?:^|_)app_(\d+)(?:$|_)",
+                text,
+                re.IGNORECASE,
+            )
+            app_id = (
+                direct_match.group(0)
+                if direct_match
+                else (
+                    link_match.group(1)
+                    if link_match
+                    else (
+                        item_match.group(1)
+                        if item_match
+                        else None
+                    )
+                )
             )
 
-    def get_text(self) -> str:
-        return " ".join(
-            self.parts
+            if app_id and app_id not in self._seen:
+                self._seen.add(app_id)
+                self.app_ids.append(app_id)
+
+
+async def search_steam_app_ids_by_title(
+    session: aiohttp.ClientSession,
+    title: str,
+    *,
+    limit: int = 5,
+) -> list[str]:
+    """Return likely Steam app IDs for a user-entered game title."""
+
+    clean_title = str(title or "").strip()
+
+    if not clean_title:
+        return []
+
+    request_url = (
+        f"{STEAM_SEARCH_SUGGEST_URL}?"
+        f"{urlencode({
+            'term': clean_title,
+            'f': 'games',
+            'cc': STEAM_COUNTRY_CODE,
+            'l': STEAM_LANGUAGE,
+            'use_store_query': '1',
+            'use_search_spellcheck': '1',
+        })}"
+    )
+
+    try:
+        async with retrying_request(
+            session,
+            "GET",
+            request_url,
+            headers=STEAM_SEARCH_HEADERS,
+            timeout=STEAM_SEARCH_TIMEOUT,
+            allow_redirects=True,
+        ) as response:
+            if response.status != 200:
+                LOGGER.warning(
+                    "Steam title search returned HTTP %s for %r",
+                    response.status,
+                    clean_title,
+                )
+                return []
+
+            response_html = await response.text(
+                errors="ignore"
+            )
+
+    except (
+        aiohttp.ClientError,
+        TimeoutError,
+    ) as error:
+        LOGGER.warning(
+            "Steam title search failed for %r: %s: %s",
+            clean_title,
+            type(error).__name__,
+            error,
         )
+        return []
+
+    parser = SteamTitleSearchParser()
+
+    try:
+        parser.feed(response_html)
+    except Exception:
+        LOGGER.exception(
+            "Could not parse Steam title results for %r",
+            clean_title,
+        )
+        return []
+
+    return parser.app_ids[:max(1, min(int(limit), 10))]
 
 
 def clean_url(
@@ -280,12 +363,16 @@ def detect_store(
     path = parsed.path.lower()
 
     if (
-        hostname == STEAM_STORE_HOST
+        hostname.endswith(
+            "steampowered.com"
+        )
         and "/app/" in path
     ):
         return "Steam"
 
-    if hostname in EPIC_STORE_HOSTS:
+    if hostname.endswith(
+        "epicgames.com"
+    ):
         return "Epic Games Store"
 
     return None
@@ -649,16 +736,40 @@ def _html_to_plain_text(
     if not page_html:
         return ""
 
-    parser = PlainTextHTMLParser()
-    parser.feed(
-        page_html
+    without_scripts = re.sub(
+        r"<script\b[^>]*>.*?</script>",
+        " ",
+        page_html,
+        flags=(
+            re.IGNORECASE
+            | re.DOTALL
+        ),
     )
-    parser.close()
+
+    without_styles = re.sub(
+        r"<style\b[^>]*>.*?</style>",
+        " ",
+        without_scripts,
+        flags=(
+            re.IGNORECASE
+            | re.DOTALL
+        ),
+    )
+
+    plain_text = re.sub(
+        r"<[^>]+>",
+        " ",
+        without_styles,
+    )
+
+    plain_text = html.unescape(
+        plain_text
+    )
 
     return re.sub(
         r"\s+",
         " ",
-        parser.get_text(),
+        plain_text,
     ).strip()
 
 
@@ -690,7 +801,7 @@ def _normalise_steam_release_date(
     *,
     now: datetime | None = None,
 ) -> str | None:
-    """Convert Steam's relative unlock text to a local display date."""
+    """Convert Steam's relative unlock text to a GMT+10 date."""
 
     cleaned = re.sub(
         r"\s+",
@@ -723,7 +834,7 @@ def _normalise_steam_release_date(
     unit = unlock_match.group(2).casefold()
 
     # Hour/minute countdowns are precise enough to resolve
-    # Steam's calendar date into the configured display timezone.
+    # Steam's calendar date into the bot's GMT+10 timezone.
     # Longer "approximately N weeks" text is only useful as
     # context, so strip it without replacing Steam's date.
     if unit.startswith("minute"):
@@ -785,7 +896,7 @@ def _normalise_steam_release_date(
 def _release_date_from_steam_timestamp(
     value,
 ) -> str | None:
-    """Format a Steam Unix release time in the display timezone."""
+    """Format a Steam Unix release time in the bot's GMT+10 zone."""
 
     try:
         timestamp = int(value)
@@ -2683,7 +2794,7 @@ async def _fetch_game_info_from_url(
 
             # Steam's Store Browse timestamp is the exact
             # unlock moment, so it wins after conversion to
-            # the configured timezone. Page and app-details strings remain
+            # GMT+10. The page and app-details strings remain
             # fallbacks when Steam does not expose a timestamp.
             release_date = (
                 timestamp_release_date
