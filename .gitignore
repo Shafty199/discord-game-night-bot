@@ -18,6 +18,8 @@ database/games.db-shm
 database/games.db-wal
 database/artwork/
 database/backups/
+database/igdb_players_cache.json
+database/steamgriddb_cache.json
 *.db-shm
 *.db-wal
 
