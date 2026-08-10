@@ -2,8 +2,8 @@
 
 A self-hosted Discord bot that turns Steam and Epic Games Store suggestions
 into fast animated game-night wheels. It maintains multiplayer and
-single-player libraries, enriches game metadata, tracks played games and
-keeps unreleased suggestions on a wishlist.
+single-player libraries, enriches game metadata, runs player-aware gaming
+sessions and schedules weekly game-night polls, events and reminders.
 
 This release is designed for **one bot instance connected to one Discord
 server**. Run a separate instance and database for each server.
@@ -18,6 +18,9 @@ one animated Discord message.
 ## Features
 
 - Steam and Epic Games Store link imports from a Discord suggestion thread
+- Player-count-aware session cards with cached spins, voice refresh and manual selection
+- Weekly Friday/Saturday polls, one-off Discord events and 24h/6h/1h reminders
+- Six-hour attendance check-ins, host transfer and end-of-session recaps
 - Smooth, single-file animated wheel with a random selection each spin
 - Online multiplayer and single-player/local-only wheels
 - SteamGridDB artwork fallback, especially for Epic titles
@@ -59,6 +62,9 @@ artwork. They are ignored by Git by default.
    - Embed Links
    - Attach Files
    - Read Message History
+   - Send Polls
+   - Create Events
+   - Connect (for a voice-channel scheduled event)
 
 6. Open the generated URL and add the bot to your server.
 
@@ -105,15 +111,26 @@ example in `config.json`:
 ```json
 {
   "suggestion_thread_id": "123456789012345678",
-  "display_timezone_offset": "+10:00",
-  "steam_country_code": "AU",
+  "session_channel_id": "123456789012345678",
+  "session_notify_role_id": "123456789012345678",
+  "logging_channel_id": "123456789012345678",
+  "game_night_channel_id": "123456789012345678",
+  "game_night_role_id": "123456789012345678",
+  "game_night_voice_channel_id": "123456789012345678",
+  "game_night_timezone": "UTC",
+  "display_timezone_offset": "+00:00",
+  "steam_country_code": "US",
   "steam_language": "english",
-  "store_accept_language": "en-AU,en;q=0.9",
-  "epic_store_locale": "en-AU"
+  "store_accept_language": "en-US,en;q=0.9",
+  "epic_store_locale": "en-US"
 }
 ```
 
-`display_timezone_offset` is a fixed UTC offset. Examples are `+10:00`,
+The session/event IDs are optional; omit them if you only want the classic
+wheel commands. `game_night_timezone` accepts an IANA timezone such as
+`America/New_York`, `Europe/London` or `Australia/Sydney` and controls the
+weekly Monday 11:00 AM poll and 9:00 PM event. `display_timezone_offset` is a
+fixed UTC offset used by store/history displays. Examples are `+10:00`,
 `-05:00` and `+05:30`. Use `+00:00` for UTC. Environment values with the
 uppercase names shown in `.env.example` override `config.json`.
 
@@ -149,6 +166,12 @@ IGDB_CLIENT_SECRET=your_client_secret
 
 The secret is a Twitch application client secret, not your Twitch password.
 
+### Optional pre-rendered spin cache
+
+For instant wheel delivery, configure the four `OCI_SPIN_*` values shown in
+`.env.example` and install/configure the Oracle Cloud SDK on the host. Without
+these values the bot renders spins locally, so this integration is optional.
+
 ## 5. Start and populate the bot
 
 Start it with:
@@ -174,6 +197,9 @@ Everyone:
 - `/history` shows recent game-night history.
 - `/stats` shows game-night statistics.
 - `/wishlist` lists unreleased suggestions.
+- `/session start` opens a player-count-aware session in the configured channel.
+- Session-card buttons join/leave, refresh voice members, spin, finish games,
+  transfer the host and end the session.
 
 Members with **Manage Server**:
 
@@ -182,7 +208,12 @@ Members with **Manage Server**:
 - `/auditgames` exports missing metadata information.
 - `/checkreleases` immediately checks wishlist release status.
 - `/undo` previews and reverses the latest lock-in.
-- `/deletegame` removes an incorrectly imported game.
+- `/removegame` removes an incorrectly imported game.
+- `/session cache` rebuilds the current session's prepared spins.
+- `/session select` manually locks in an existing wheel game.
+- `/session custom` looks up and locks in a title that is not on the wheel.
+- `/game-night preview` posts a non-pinging weekly-flow preview.
+- `/game-night status` shows the current poll, event and reminder state.
 - `/resetplaycounts` resets play history after confirmation.
 
 ## Storage and backups
@@ -233,6 +264,9 @@ python -m unittest discover -s tests -v
 - **Missing artwork:** configure SteamGridDB, then run `/syncgames`.
 - **Missing player data:** configure IGDB, then run `/syncgames`.
 - **Permission errors:** recheck the permissions listed in the Discord setup.
+- **Weekly poll/event does not run:** configure the game-night channel, role,
+  voice channel and IANA timezone, then confirm Send Polls, Create Events and
+  Connect are allowed.
 - **A spin waits before rendering:** GIF creation is intentionally limited to
   one at a time per bot instance to protect small hosting plans from memory
   and CPU spikes.
@@ -275,3 +309,4 @@ vulnerabilities must be reported privately using the instructions in
 ## Licence
 
 Released under the [MIT License](LICENSE).
+
