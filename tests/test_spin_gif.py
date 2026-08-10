@@ -3,19 +3,65 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from utils.spin_gif import (
+    CANVAS_HEIGHT,
+    CANVAS_WIDTH,
     MAX_SPIN_GIF_BYTES,
     SPIN_FRAME_DURATIONS_MS,
     SUSPENSE_DURATION_MS,
     WINNER_FLASH_DURATION_MS,
+    _artwork_panel,
     build_spin_sequence,
     build_spin_gif,
 )
 
 
 class SpinGifTests(unittest.TestCase):
+    def test_artwork_panel_preserves_the_complete_image(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            artwork_path = (
+                Path(temporary_directory)
+                / "complete-artwork.png"
+            )
+            artwork = Image.new(
+                "RGB",
+                (200, 200),
+                (40, 180, 70),
+            )
+
+            for x_position in range(200):
+                for y_position in range(20):
+                    artwork.putpixel(
+                        (x_position, y_position),
+                        (230, 40, 40),
+                    )
+                    artwork.putpixel(
+                        (x_position, 199 - y_position),
+                        (40, 80, 230),
+                    )
+
+            artwork.save(
+                artwork_path,
+                format="PNG",
+            )
+            panel = _artwork_panel(
+                artwork_path
+            )
+            centre_x = panel.width // 2
+
+            self.assertEqual(
+                panel.getpixel((centre_x, 2))[:3],
+                (230, 40, 40),
+            )
+            self.assertEqual(
+                panel.getpixel(
+                    (centre_x, panel.height - 3)
+                )[:3],
+                (40, 80, 230),
+            )
+
     def test_consecutive_spins_get_different_sequences(self):
         games = [
             {
@@ -51,9 +97,14 @@ class SpinGifTests(unittest.TestCase):
             for game in second_sequence
         ]
 
-        expected_frames = len(SPIN_FRAME_DURATIONS_MS)
-        self.assertEqual(len(first_ids), expected_frames)
-        self.assertEqual(len(second_ids), expected_frames)
+        self.assertEqual(
+            len(first_ids),
+            len(SPIN_FRAME_DURATIONS_MS),
+        )
+        self.assertEqual(
+            len(second_ids),
+            len(SPIN_FRAME_DURATIONS_MS),
+        )
         self.assertNotEqual(first_ids, second_ids)
         self.assertNotIn(winner["id"], first_ids)
         self.assertNotIn(winner["id"], second_ids)
@@ -99,7 +150,9 @@ class SpinGifTests(unittest.TestCase):
                         ]
                     ),
                 }
-                for index in range(10)
+                for index in range(
+                    len(SPIN_FRAME_DURATIONS_MS)
+                )
             ]
             winner = {
                 "id": 99,
@@ -124,11 +177,7 @@ class SpinGifTests(unittest.TestCase):
             )
 
             expected_duration = (
-                sum(
-                    SPIN_FRAME_DURATIONS_MS[
-                        : len(sequence)
-                    ]
-                )
+                sum(SPIN_FRAME_DURATIONS_MS)
                 + SUSPENSE_DURATION_MS
                 + WINNER_FLASH_DURATION_MS
             ) / 1000
@@ -140,12 +189,26 @@ class SpinGifTests(unittest.TestCase):
             with Image.open(
                 io.BytesIO(result.data)
             ) as animation:
+                self.assertEqual(
+                    animation.size,
+                    (CANVAS_WIDTH, CANVAS_HEIGHT),
+                )
                 self.assertTrue(
                     animation.is_animated
                 )
                 self.assertEqual(
                     animation.n_frames,
-                    12,
+                    len(SPIN_FRAME_DURATIONS_MS) + 2,
+                )
+                animation.seek(animation.n_frames - 2)
+                suspense_frame = animation.convert("RGB")
+                animation.seek(animation.n_frames - 1)
+                winner_frame = animation.convert("RGB")
+                self.assertIsNotNone(
+                    ImageChops.difference(
+                        suspense_frame,
+                        winner_frame,
+                    ).getbbox()
                 )
 
     def test_missing_artwork_uses_a_placeholder(self):
@@ -156,7 +219,9 @@ class SpinGifTests(unittest.TestCase):
                 "store": "Unknown Store",
                 "artwork_path": None,
             }
-            for index in range(10)
+            for index in range(
+                len(SPIN_FRAME_DURATIONS_MS)
+            )
         ]
         winner = {
             "id": 99,
@@ -180,3 +245,4 @@ class SpinGifTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
