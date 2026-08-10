@@ -187,7 +187,7 @@ async def _request_steam_app_data(
             STEAM_DETAILS_URL,
             params={
                 "appids": app_id,
-                "cc": STEAM_COUNTRY_CODE.casefold(),
+                "cc": STEAM_COUNTRY_CODE.lower(),
                 "l": STEAM_LANGUAGE,
             },
             headers=STEAM_DETAILS_HEADERS,
