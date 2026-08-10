@@ -1,4 +1,6 @@
 import math
+import logging
+import time
 
 import discord
 from discord import app_commands
@@ -8,13 +10,16 @@ from database.database import (
     get_all_games,
     get_all_singleplayer_games,
     get_smart_random_game,
+    get_smart_random_game_for_ids,
     get_smart_random_singleplayer_game,
 )
 from settings import EPIC_EMOJI, STEAM_EMOJI
 from ui.animation import (
     animate_spin,
+    create_hosted_spin_embed,
     create_starting_spin_embed,
     edit_spin_result,
+    wait_for_hosted_spin,
 )
 from ui.buttons import SpinView
 from ui.embeds import create_spin_embed
@@ -26,6 +31,7 @@ from utils.time_utils import (
 
 
 GAMES_PER_PAGE = 10
+LOGGER = logging.getLogger(__name__)
 
 
 class GameListView(discord.ui.View):
@@ -265,15 +271,46 @@ class Games(commands.Cog):
         interaction: discord.Interaction,
         *,
         wheel_type: str,
+        session_context: dict | None = None,
     ):
-        if wheel_type == "singleplayer":
-            winning_game = (
-                await get_smart_random_singleplayer_game()
+        prepared_spin_manager = getattr(
+            self.bot,
+            "prepared_spin_manager",
+            None,
+        )
+        if session_context is not None:
+            prepared_spin = (
+                await prepared_spin_manager.acquire_session(
+                    session_context["session_id"],
+                    generation=session_context["generation"],
+                )
+                if prepared_spin_manager is not None
+                else None
             )
         else:
-            winning_game = (
-                await get_smart_random_game()
+            prepared_spin = (
+                await prepared_spin_manager.acquire(
+                    wheel_type
+                )
+                if prepared_spin_manager is not None
+                else None
             )
+
+        if prepared_spin is not None:
+            winning_game = prepared_spin.winning_game
+
+        elif session_context is not None:
+            winning_game = await get_smart_random_game_for_ids(
+                session_context["eligible_game_ids"]
+            )
+
+        elif wheel_type == "singleplayer":
+            winning_game = await (
+                get_smart_random_singleplayer_game()
+            )
+
+        else:
+            winning_game = await get_smart_random_game()
 
         if not winning_game:
             await interaction.response.send_message(
@@ -287,21 +324,50 @@ class Games(commands.Cog):
             )
             return
 
-        await interaction.response.send_message(
-            embed=create_starting_spin_embed(
-                wheel_type
+        if prepared_spin is not None:
+            delivery_started_at = time.perf_counter()
+            await interaction.response.send_message(
+                embed=create_hosted_spin_embed(
+                    wheel_type,
+                    prepared_spin.image_url,
+                )
             )
-        )
+            LOGGER.info(
+                "Hosted spin displayed: wheel=%s winner_id=%s "
+                "discord_response=%.3fs",
+                wheel_type,
+                prepared_spin.winner_id,
+                time.perf_counter() - delivery_started_at,
+            )
+
+        else:
+            await interaction.response.send_message(
+                embed=create_starting_spin_embed(
+                    wheel_type
+                )
+            )
 
         message = await interaction.original_response()
 
-        sale_info = await animate_with_sale_lookup(
-            animate_spin(
+        if prepared_spin is not None:
+            animation = wait_for_hosted_spin(
+                prepared_spin.duration_seconds
+            )
+        else:
+            animation = animate_spin(
                 message=message,
                 winning_game=winning_game,
                 wheel_type=wheel_type,
                 session=self.bot.http_session,
-            ),
+                eligible_game_ids=(
+                    session_context["eligible_game_ids"]
+                    if session_context is not None
+                    else None
+                ),
+            )
+
+        sale_info = await animate_with_sale_lookup(
+            animation,
             session=self.bot.http_session,
             game=winning_game,
         )
@@ -317,8 +383,20 @@ class Games(commands.Cog):
                 winning_game,
                 sale_info=sale_info,
                 wheel_type=wheel_type,
+                session_context=session_context,
             ),
             game_id=winning_game[0],
+        )
+
+    async def run_session_spin(
+        self,
+        interaction: discord.Interaction,
+        session_context: dict,
+    ):
+        await self._run_spin(
+            interaction,
+            wheel_type="multiplayer",
+            session_context=session_context,
         )
 
     @app_commands.command(
