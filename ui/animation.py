@@ -2,6 +2,8 @@ import asyncio
 import io
 import logging
 import secrets
+import time
+from dataclasses import dataclass
 
 import discord
 
@@ -33,6 +35,19 @@ SPIN_DELAYS = [
 SPIN_GIF_FILENAME_PREFIX = "game-night-wheel"
 SPIN_GIF_DELIVERY_GRACE_SECONDS = 0.85
 GIF_RENDER_SEMAPHORE = asyncio.Semaphore(1)
+
+
+@dataclass(frozen=True)
+class RenderedSpinGif:
+    duration_seconds: float
+    gif_size_bytes: int
+    candidate_count: int
+    frame_count: int
+    game_load_seconds: float
+    sequence_seconds: float
+    artwork_seconds: float
+    render_queue_seconds: float
+    render_seconds: float
 
 
 SPIN_STATUS_LINES = [
@@ -347,12 +362,42 @@ def _create_winner_flash_embed(
 
 async def _get_animation_games(
     wheel_type: str = "multiplayer",
+    eligible_game_ids=None,
 ) -> list[dict]:
     wheel_filter = (
         SINGLEPLAYER_WHEEL_FILTER
         if wheel_type == "singleplayer"
         else MULTIPLAYER_WHEEL_FILTER
     )
+
+    clean_eligible_ids = (
+        tuple(
+            sorted(
+                {
+                    int(game_id)
+                    for game_id in eligible_game_ids
+                }
+            )
+        )
+        if eligible_game_ids is not None
+        else None
+    )
+
+    if clean_eligible_ids == ():
+        return []
+
+    eligibility_clause = ""
+    parameters = ()
+
+    if clean_eligible_ids is not None:
+        placeholders = ", ".join(
+            "?"
+            for _game_id in clean_eligible_ids
+        )
+        eligibility_clause = (
+            f"AND id IN ({placeholders})"
+        )
+        parameters = clean_eligible_ids
 
     async with database_connection() as db:
         cursor = await db.execute(
@@ -377,8 +422,10 @@ async def _get_animation_games(
                     OR link_status != 'dead'
                 )
                 AND {wheel_filter}
+                {eligibility_clause}
             ORDER BY name COLLATE NOCASE
-            """
+            """,
+            parameters,
         )
 
         rows = await cursor.fetchall()
@@ -534,9 +581,9 @@ async def _prepare_local_artwork(
         )
 
 
-def _create_gif_embed(
+def _create_gif_embed_from_url(
     wheel_type: str,
-    gif_filename: str,
+    image_url: str,
 ) -> discord.Embed:
     singleplayer = (
         wheel_type == "singleplayer"
@@ -558,12 +605,130 @@ def _create_gif_embed(
         ),
     )
     embed.set_image(
-        url=f"attachment://{gif_filename}"
+        url=image_url
     )
     embed.set_footer(
         text="The winner card will appear when the wheel stops."
     )
     return embed
+
+
+def _create_gif_embed(
+    wheel_type: str,
+    gif_filename: str,
+) -> discord.Embed:
+    return _create_gif_embed_from_url(
+        wheel_type,
+        f"attachment://{gif_filename}",
+    )
+
+
+def create_hosted_spin_embed(
+    wheel_type: str,
+    image_url: str,
+) -> discord.Embed:
+    cleaned_image_url = _clean_image_url(
+        image_url
+    )
+
+    if cleaned_image_url is None:
+        raise ValueError(
+            "A hosted spin requires a valid HTTP image URL."
+        )
+
+    return _create_gif_embed_from_url(
+        wheel_type,
+        cleaned_image_url,
+    )
+
+
+async def wait_for_hosted_spin(
+    duration_seconds: float,
+) -> None:
+    await asyncio.sleep(
+        max(
+            float(duration_seconds),
+            0.0,
+        )
+        + SPIN_GIF_DELIVERY_GRACE_SECONDS
+    )
+
+
+async def render_spin_gif_file(
+    *,
+    winning_game,
+    wheel_type: str,
+    session,
+    output_path,
+    eligible_game_ids=None,
+) -> RenderedSpinGif:
+    """Render one random wheel directly to disk for later delivery."""
+
+    winner = _winner_to_card(
+        winning_game
+    )
+
+    game_load_started_at = time.perf_counter()
+    games = await _get_animation_games(
+        wheel_type=wheel_type,
+        eligible_game_ids=eligible_game_ids,
+    )
+    game_load_seconds = (
+        time.perf_counter()
+        - game_load_started_at
+    )
+
+    sequence_started_at = time.perf_counter()
+    sequence = build_spin_sequence(
+        games=games,
+        winner=winner,
+        wheel_type=wheel_type,
+    )
+    sequence_seconds = (
+        time.perf_counter()
+        - sequence_started_at
+    )
+
+    artwork_started_at = time.perf_counter()
+    await _prepare_local_artwork(
+        [*sequence, winner],
+        session=session,
+    )
+    artwork_seconds = (
+        time.perf_counter()
+        - artwork_started_at
+    )
+
+    render_queue_started_at = time.perf_counter()
+    async with GIF_RENDER_SEMAPHORE:
+        render_queue_seconds = (
+            time.perf_counter()
+            - render_queue_started_at
+        )
+        render_started_at = time.perf_counter()
+        spin_gif = await asyncio.to_thread(
+            build_spin_gif,
+            sequence,
+            winner,
+            wheel_type=wheel_type,
+            output_path=output_path,
+        )
+        render_seconds = (
+            time.perf_counter()
+            - render_started_at
+        )
+
+    return RenderedSpinGif(
+        duration_seconds=spin_gif.duration_seconds,
+        gif_size_bytes=output_path.stat().st_size,
+        candidate_count=len(games),
+        frame_count=len(sequence),
+        game_load_seconds=game_load_seconds,
+        sequence_seconds=sequence_seconds,
+        artwork_seconds=artwork_seconds,
+        render_queue_seconds=render_queue_seconds,
+        render_seconds=render_seconds,
+    )
 
 
 def _load_gif_into_memory(
@@ -698,6 +863,7 @@ async def animate_spin(
     message=None,
     wheel_type: str = "multiplayer",
     session=None,
+    eligible_game_ids=None,
 ) -> None:
     edit_target = (
         target
@@ -710,16 +876,30 @@ async def animate_spin(
             "'target' or 'message'."
         )
 
+    spin_started_at = time.perf_counter()
     winner = _winner_to_card(
         winning_game
     )
+
+    game_load_started_at = time.perf_counter()
     games = await _get_animation_games(
-        wheel_type=wheel_type
+        wheel_type=wheel_type,
+        eligible_game_ids=eligible_game_ids,
     )
+    game_load_seconds = (
+        time.perf_counter()
+        - game_load_started_at
+    )
+
+    sequence_started_at = time.perf_counter()
     sequence = build_spin_sequence(
         games=games,
         winner=winner,
         wheel_type=wheel_type,
+    )
+    sequence_seconds = (
+        time.perf_counter()
+        - sequence_started_at
     )
     gif_filename = (
         f"{SPIN_GIF_FILENAME_PREFIX}-"
@@ -731,11 +911,23 @@ async def animate_spin(
     )
 
     try:
+        artwork_started_at = time.perf_counter()
         await _prepare_local_artwork(
             [*sequence, winner],
             session=session,
         )
+        artwork_seconds = (
+            time.perf_counter()
+            - artwork_started_at
+        )
+
+        render_queue_started_at = time.perf_counter()
         async with GIF_RENDER_SEMAPHORE:
+            render_queue_seconds = (
+                time.perf_counter()
+                - render_queue_started_at
+            )
+            render_started_at = time.perf_counter()
             spin_gif = await asyncio.to_thread(
                 build_spin_gif,
                 sequence,
@@ -743,12 +935,23 @@ async def animate_spin(
                 wheel_type=wheel_type,
                 output_path=gif_path,
             )
+            render_seconds = (
+                time.perf_counter()
+                - render_started_at
+            )
+
         spin_duration_seconds = (
             spin_gif.duration_seconds
         )
+        gif_size_bytes = gif_path.stat().st_size
+        gif_read_started_at = time.perf_counter()
         gif_buffer = await asyncio.to_thread(
             _load_gif_into_memory,
             gif_path,
+        )
+        gif_read_seconds = (
+            time.perf_counter()
+            - gif_read_started_at
         )
         await asyncio.to_thread(
             gif_path.unlink,
@@ -760,6 +963,7 @@ async def animate_spin(
         )
 
         try:
+            upload_started_at = time.perf_counter()
             await _edit_target(
                 edit_target,
                 embed=_create_gif_embed(
@@ -769,10 +973,38 @@ async def animate_spin(
                 view=None,
                 attachments=[gif_file],
             )
+            upload_seconds = (
+                time.perf_counter()
+                - upload_started_at
+            )
 
         finally:
             gif_file.close()
             gif_buffer.close()
+
+        server_ready_seconds = (
+            time.perf_counter()
+            - spin_started_at
+        )
+        LOGGER.info(
+            "Spin timing: wheel=%s candidates=%d frames=%d "
+            "game_load=%.3fs sequence=%.3fs artwork=%.3fs "
+            "render_queue=%.3fs render=%.3fs gif_read=%.3fs "
+            "discord_upload=%.3fs gif_size=%.2fMiB "
+            "server_ready=%.3fs",
+            wheel_type,
+            len(games),
+            len(sequence),
+            game_load_seconds,
+            sequence_seconds,
+            artwork_seconds,
+            render_queue_seconds,
+            render_seconds,
+            gif_read_seconds,
+            upload_seconds,
+            gif_size_bytes / (1024 * 1024),
+            server_ready_seconds,
+        )
 
         spin_gif = None
         gif_file = None
@@ -785,8 +1017,9 @@ async def animate_spin(
 
     except Exception:
         LOGGER.exception(
-            "Single-file wheel animation failed; "
-            "using the compatibility animation."
+            "Single-file wheel animation failed after %.3fs; "
+            "using the compatibility animation.",
+            time.perf_counter() - spin_started_at,
         )
 
     finally:
